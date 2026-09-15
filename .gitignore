@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Databricks Asset Bundles: local deploy state
+.databricks/
+
+# Local Spark (unit tests)
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Secrets / OS
+.env
+.DS_Store

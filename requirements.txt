@@ -1,0 +1,4 @@
+# Local development: PySpark + Delta Lake (versions verified together locally).
+# Databricks serverless ships its own runtime; align these once the workspace is set up.
+pyspark==4.2.0
+delta-spark==4.4.0
