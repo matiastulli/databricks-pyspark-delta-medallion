@@ -10,7 +10,7 @@ A **learning-path portfolio project**: a medallion lakehouse on Databricks built
 
 Learning path (tick them off in `README.md` as they land):
 0. Local environment: PySpark + Delta on the laptop, done first because the Databricks site was down during setup
-1. Setup: Databricks Free Edition, Databricks CLI auth, Unity Catalog catalog + `bronze`/`silver`/`gold` schemas
+1. Setup: Databricks Free Edition, Databricks CLI auth, Unity Catalog catalog + `00_bronze`/`01_silver`/`02_gold` schemas
 2. Bronze: PySpark ingestion of `samples.nyctaxi.trips` into Delta, with ingestion metadata
 3. Silver: cleaning/typing, idempotent Delta `MERGE`
 4. Gold: aggregates (daily trips/revenue, busiest zones) + data quality checks that fail the run
@@ -20,7 +20,8 @@ Learning path (tick them off in `README.md` as they land):
 ## Environment
 
 - Databricks **Free Edition**: serverless compute only, with usage limits. If a step doesn't fit, adapt the step rather than suggest a paid plan.
-- Databricks CLI (Homebrew). Authenticate with `databricks auth login` (browser OAuth). **Never ask for or handle personal access tokens in chat.**
+- Databricks CLI (Homebrew). Authenticate with `databricks auth login` (browser OAuth). **Never ask for or handle personal access tokens in chat.** The CLI uses the `DEFAULT` profile in `~/.databrickscfg`. Keep the workspace host out of committed files.
+- Unity Catalog: catalog `medallion` with schemas `00_bronze`, `01_silver`, `02_gold`. The user chose these names so the schemas sort in pipeline order. Unquoted names like `medallion.00_bronze.trips` parse fine (checked on the warehouse), and the setup script quotes them with backticks anyway. Free Edition's metastore has no storage root, so `databricks catalogs create` fails. Create catalogs with SQL on the serverless warehouse, which uses Default Storage. The only warehouse is the "Serverless Starter Warehouse". Stop it after ad-hoc SQL to save quota.
 - Local: Python 3.11 and Java 17 (Homebrew `openjdk@17`). Versions are pinned in `requirements.txt` (PySpark 4.2.0 + delta-spark 4.4.0) and were verified together locally. The Databricks serverless runtime may differ, so align the pins once the workspace exists.
 
 ```sh
@@ -29,6 +30,16 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 ```
 
 A local Delta-enabled session needs `configure_spark_with_delta_pip(builder)` plus the two Delta configs: `spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension` and `spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog`. The first session downloads the Delta jars from Maven into `~/.ivy2.5.2`, which takes about a minute. pip lists the package as `delta_spark`.
+
+Databricks commands:
+
+```sh
+databricks auth login --host https://<workspace>.cloud.databricks.com   # browser OAuth, saves the DEFAULT profile
+databricks current-user me                                               # check the auth works
+scripts/setup_unity_catalog.sh                                           # idempotent: catalog + 00_bronze/01_silver/02_gold schemas
+databricks schemas list medallion
+databricks warehouses stop <warehouse-id> --no-wait                      # warehouse IDs come from `databricks warehouses list`
+```
 
 ## Working agreements
 
