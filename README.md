@@ -8,6 +8,8 @@ The data is the [NYC taxi trips](https://docs.databricks.com/aws/en/discover/dat
 
 ## Learning path
 
+The detailed plan, with decisions and what each step learned, is in [docs/PLAN.md](docs/PLAN.md).
+
 - [x] **0. Local environment:** PySpark + Delta Lake on a laptop (Java 17), with a local Delta `MERGE` checked end to end
 - [x] **1. Setup:** Databricks Free Edition, CLI authentication, Unity Catalog catalog with `00_bronze` / `01_silver` / `02_gold` schemas
 - [x] **2. Bronze:** ingest raw trips into Delta with PySpark, adding ingestion metadata

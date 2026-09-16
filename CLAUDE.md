@@ -8,7 +8,7 @@ A **learning-path portfolio project**: a medallion lakehouse on Databricks built
 
 **Build it one step at a time.** Never scaffold later steps ahead of time; each step adds only what it needs, with explanations. The user prefers easy-going example data over business rules.
 
-Learning path (tick them off in `README.md` as they land):
+Learning path (tick them off in `README.md` as they land, and update `docs/PLAN.md` with status, decisions and learnings; plan changes to later steps go into `docs/PLAN.md` before the code):
 0. Local environment: PySpark + Delta on the laptop, done first because the Databricks site was down during setup
 1. Setup: Databricks Free Edition, Databricks CLI auth, Unity Catalog catalog + `00_bronze`/`01_silver`/`02_gold` schemas
 2. Bronze: PySpark ingestion of `samples.nyctaxi.trips` into Delta, with ingestion metadata
