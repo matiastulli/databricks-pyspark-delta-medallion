@@ -253,15 +253,15 @@ Built:
   Jobs that create tables also need `CREATE` privileges they otherwise wouldn't.
 
 **Scope rule (the user's decision): DDL holds only the final tables.**
-- **In `src/ddl/`:** every table a process *publishes*, meaning the tables other processes, people or tools read: every bronze source table, silver `trips` and `trips_quarantine`, and the gold tables.
-- **Not in `src/ddl/`:** anything that only exists **during one transformation**, such as intermediate DataFrames, temporary views (`createOrReplaceTempView`) and CTEs. They belong to the process's code and disappear when the run ends.
+- **In the `ddl/` folders:** every table a process *publishes*, meaning the tables other processes, people or tools read: every bronze source table, silver `trips` and `trips_quarantine`, and the gold tables.
+- **Not in the `ddl/` folders:** anything that only exists **during one transformation**, such as intermediate DataFrames, temporary views (`createOrReplaceTempView`) and CTEs. They belong to the process's code and disappear when the run ends.
   - Today every intermediate step (`keyed`, `deduplicated`, `valid`/`rejected`, the aggregates before the checks) is already an in-memory DataFrame, so nothing moves out of the code.
-  - If a transformation ever needs a temporary **persisted** table (for example, to break up a very long plan), the job creates it and drops it at the end of the run, and it stays out of `src/ddl/`. Its name must make that clear, e.g. a `_tmp_` prefix.
+  - If a transformation ever needs a temporary **persisted** table (for example, to break up a very long plan), the job creates it and drops it at the end of the run, and it stays out of the `ddl/` folders. Its name must make that clear, e.g. a `_tmp_` prefix.
 
 **Decisions (the user's):**
-- **Migrations live in `src/ddl/migrations/`,** inside `src/` next to the code that writes the tables, and deployed with it.
+- **Migrations live next to their schema's code, versioned per table:** `src/<NN_layer>/ddl/<verb>_<layer>_<table>_v<NNN>.sql`, e.g. `src/01_silver/ddl/create_silver_trips_v001.sql`. Each table has its own version sequence, and the version goes at the end of the file name. They are deployed with the rest of `src/`.
 - **Runner: a small in-repo runner,** not Flyway or Liquibase. It keeps the project PySpark-only and is small enough to test fully.
-- **Schemas move into a migration** (`V001__create_schemas.sql`), not the bundle's `schema` resource. We tested the bundle resource on Free Edition with a throwaway bundle, and it showed two problems:
+- **Schemas move into a migration** (`src/00_bronze/ddl/create_schemas_v001.sql`), not the bundle's `schema` resource. We tested the bundle resource on Free Edition with a throwaway bundle, and it showed two problems:
   - **development mode renames the schemas:** `zz_schema_probe` was created as `medallion.dev_jmatiastulli_zz_schema_probe`, so in `dev` the bundle would create parallel schemas instead of adopting `00_bronze`, `01_silver` and `02_gold`
   - **`bundle destroy` dropped the schema together with a table holding data**
 
@@ -282,7 +282,7 @@ Built:
 | Bronze | `<source_system>_<source_table>` | `nyctaxi_trips`, `tpch_orders`, `tpch_customer` | Mirrors the source exactly, including its singular/plural. The system prefix prevents collisions when two systems have a table with the same name. |
 | Silver | `<entity>` as a plural noun, plus `<entity>_quarantine` for its rejected rows | `trips`, `trips_quarantine` | A cleaned, conformed business entity no longer belongs to one source system |
 | Gold | `fct_<event>` (one row per event), `dim_<entity>` (one row per entity), `agg_<subject>_<grain>` (aggregates and scorecards) | `agg_trips_daily`, `agg_trips_by_pickup_zip` | The prefix says how to use the table, the same convention as `fct_orders` / `dim_customers` in [dbt-terraform-postgres-medallion](https://github.com/matiastulli/dbt-terraform-postgres-medallion) |
-| Temporary (never in `src/ddl/`) | `_tmp_<process>_<purpose>`, created and dropped within one run | `_tmp_clean_trips_keyed` | Anything starting with `_tmp_` is safe to drop |
+| Temporary (never in `ddl/`) | `_tmp_<process>_<purpose>`, created and dropped within one run | `_tmp_clean_trips_keyed` | Anything starting with `_tmp_` is safe to drop |
 | Bookkeeping | `ops.<purpose>` | `ops.schema_migrations` | Owned by tooling, not by a pipeline |
 
 *Columns*
@@ -294,7 +294,10 @@ Built:
 - Keys: `<entity>_id`, e.g. `trip_id`; booleans: `is_<state>` / `has_<thing>`
 
 *Migrations*
-- `V<NNN>__<verb>_<layer>_<table>.sql`, e.g. `V004__create_silver_trips.sql`, `V012__rename_gold_daily_trips.sql`
+- `src/<NN_layer>/ddl/<create|alter|rename|drop>_<layer>_<table>_v<NNN>.sql`, with versions counted **per table** from `v001`, e.g. `create_silver_trips_v001.sql`, then `alter_silver_trips_v002.sql`
+- The schemas: `src/00_bronze/ddl/create_schemas_v001.sql`
+- A table's history starts with `create` (v001). A rename starts the **new** table's history and names both tables: `rename_<layer>_<old>_to_<new>_v001.sql`, e.g. `rename_bronze_trips_to_nyctaxi_trips_v001.sql`
+- The layer in the file name must match its folder (`silver` only in `01_silver/ddl/`)
 
 *Enforcement*
 - Bronze targets are **derived** from the source instead of written by hand: `samples.nyctaxi.trips` → `nyctaxi_trips`. The `target` field leaves `config/sources.toml`, which removes one thing to get wrong (tested).
@@ -311,26 +314,26 @@ Built:
 `tpch_*`, silver `trips` and `trips_quarantine` already match. Code that follows the renames: `clean_trips.py` reads `nyctaxi_trips`, the `clean_trips` trigger watches `00_bronze.nyctaxi_trips`, the gold writes, and the docs. Verify on the workspace that the Delta history and data survive the rename, and that the trigger fires on the new name.
 
 Planned:
-- **`src/ddl/migrations/`: numbered, write-once SQL files** (Flyway style), for example:
+- **Write-once SQL files in each schema's `ddl/` folder, versioned per table,** for example:
   ```
-  V001__create_schemas.sql                    CREATE SCHEMA IF NOT EXISTS 00_bronze / 01_silver / 02_gold
-  V002__create_bronze_trips.sql               baseline: the tables exactly as they exist today
-  V003__create_bronze_tpch_region.sql …
-  V010__create_silver_trips.sql
-  V011__create_silver_trips_quarantine.sql
-  V012__create_gold_daily_trips.sql
-  V013__create_gold_busiest_pickup_zones.sql
-  V014__rename_bronze_trips.sql               then the naming convention renames
-  V015__rename_gold_daily_trips.sql
-  V016__rename_gold_busiest_pickup_zones.sql
+  src/00_bronze/ddl/create_schemas_v001.sql                         CREATE SCHEMA IF NOT EXISTS 00_bronze / 01_silver / 02_gold
+  src/00_bronze/ddl/create_bronze_trips_v001.sql                    baseline: the tables exactly as they exist today
+  src/00_bronze/ddl/create_bronze_tpch_region_v001.sql …
+  src/01_silver/ddl/create_silver_trips_v001.sql
+  src/01_silver/ddl/create_silver_trips_quarantine_v001.sql
+  src/02_gold/ddl/create_gold_daily_trips_v001.sql
+  src/02_gold/ddl/create_gold_busiest_pickup_zones_v001.sql
+  src/00_bronze/ddl/rename_bronze_trips_to_nyctaxi_trips_v001.sql   then the naming convention renames
+  src/02_gold/ddl/rename_gold_daily_trips_to_agg_trips_daily_v001.sql
+  src/02_gold/ddl/rename_gold_busiest_pickup_zones_to_agg_trips_by_pickup_zip_v001.sql
   ```
-  A schema change is always a **new** file (e.g. `ALTER TABLE … ADD COLUMNS`). Applied files are never edited.
+  A schema change is always a **new** version of that table (e.g. `alter_silver_trips_v002.sql` with `ALTER TABLE … ADD COLUMNS`). Applied files are never edited.
 - **Baseline first:** the tables already exist with data, so the first migrations must describe them **exactly as they are today** (columns, types, `NOT NULL`, comments). They adopt the tables without rewriting or losing data, and applying them is checked against `DESCRIBE TABLE`.
 - **A small migration runner** in `src/medallion/migrations.py` plus an `apply_ddl` workflow (serverless notebook, `spark.sql`):
-  - reads `src/ddl/migrations/*.sql` in version order
-  - records applied versions in `medallion.ops.schema_migrations` (`version`, `file`, `checksum`, `applied_at`). The runner creates that schema and table itself on its first run, like Flyway's history table, because it has to exist before any migration can be recorded.
+  - reads `src/*/ddl/*.sql` and runs them in this order: `schemas` first, then layer folders (00, 01, 02), tables by name, each table's versions ascending, and **a renamed table always after the table it renames**. Otherwise `nyctaxi_trips` would sort before `trips`, and on a fresh catalog the rename would run before `trips` exists.
+  - records applied versions in `medallion.ops.schema_migrations` (`migration` = `schemas` or `<layer>_<table>`, `version`, `file`, `checksum`, `applied_at`). The runner creates that schema and table itself on its first run, like Flyway's history table, because it has to exist before any migration can be recorded.
   - applies only pending migrations, so reruns do nothing
-  - **fails if an applied migration's file changed** (checksum mismatch), if two files share a version, or if a version is missing
+  - **fails if an applied migration's file changed** (checksum mismatch), moved or disappeared, and if a table has duplicate or missing versions, a misplaced or misnamed file, or a rename of a table that has no migrations
 - **Jobs stop creating tables:**
   - `clean_trips.py` loses its `CREATE TABLE` cells
   - `build_trip_metrics.py` overwrites data without `overwriteSchema`
@@ -338,7 +341,7 @@ Planned:
   - A missing table or a mismatched schema fails the run with a clear error
 - **Deploy order (CD stays on the laptop):** `databricks bundle deploy` → `databricks bundle run apply_ddl` → pipelines
 - **High-risk tests:**
-  - the runner's logic: version ordering such as `V2` before `V10`, only pending migrations run, and checksum drift, duplicate or missing versions and bad file names all fail
+  - the runner's logic: run order (schemas → folders → tables → versions, `v010` after `v009`, renames after their source table), only pending migrations run, and checksum drift, duplicate or missing versions, misplaced or misnamed files all fail
   - bronze target names derived from the source
   - the rest of the runner goes in the full test suite as before
 - **Get it working early:**

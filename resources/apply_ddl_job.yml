@@ -2,7 +2,7 @@ resources:
   jobs:
     apply_ddl:
       name: apply_ddl
-      description: Applies pending DDL migrations from src/ddl/migrations. The only process that creates or changes tables
+      description: Applies pending DDL migrations from src/<NN_layer>/ddl. The only process that creates or changes tables
       tags:
         layer: ops
 

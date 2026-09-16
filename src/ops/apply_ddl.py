@@ -3,8 +3,12 @@
 # MAGIC # Apply DDL migrations
 # MAGIC
 # MAGIC Tables are created and changed only here, never by the jobs that write to them. This notebook applies the
-# MAGIC write-once SQL files in `src/ddl/migrations/` that haven't run yet, in version order, and records each one in
-# MAGIC `<catalog>.ops.schema_migrations`.
+# MAGIC write-once SQL files in `src/<NN_layer>/ddl/` that haven't run yet and records each one in
+# MAGIC `<catalog>.ops.schema_migrations`. Every table has its own version sequence (`create_silver_trips_v001.sql`,
+# MAGIC `alter_silver_trips_v002.sql`, …).
+# MAGIC
+# MAGIC **Run order:** `schemas` first, then layer folders (00, 01, 02), tables by name, each table's versions ascending,
+# MAGIC and a renamed table always after the table it renames.
 # MAGIC
 # MAGIC - **Reruns do nothing:** applied versions are skipped.
 # MAGIC - **Applied migrations are write-once:** if one was edited, renamed or deleted since it ran, the run fails before
@@ -45,16 +49,17 @@ history_table = f"`{catalog}`.`{HISTORY_SCHEMA}`.`{HISTORY_TABLE}`"
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{HISTORY_SCHEMA}` COMMENT 'Pipeline bookkeeping owned by tooling'")
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {history_table} (
-  version    INT       NOT NULL COMMENT 'Migration version, V<NNN>',
-  file       STRING    NOT NULL COMMENT 'Migration file name',
+  migration  STRING    NOT NULL COMMENT 'What the migration versions: schemas or <layer>_<table>',
+  version    INT       NOT NULL COMMENT 'Version within that table, v<NNN>',
+  file       STRING    NOT NULL COMMENT 'Migration file, relative to src/',
   checksum   STRING    NOT NULL COMMENT 'SHA-256 of the file as applied',
   applied_at TIMESTAMP NOT NULL
 )
-COMMENT 'DDL migrations applied from src/ddl/migrations by src/ops/apply_ddl.py'
+COMMENT 'DDL migrations applied from src/<NN_layer>/ddl by src/ops/apply_ddl.py'
 """)
 
 migrations = load_migrations()
-applied = {row.version: (row.file, row.checksum) for row in spark.table(history_table).collect()}
+applied = {(row.migration, row.version): (row.file, row.checksum) for row in spark.table(history_table).collect()}
 pending = pending_migrations(migrations, applied)
 print(f"{len(migrations)} migrations, {len(applied)} already applied, {len(pending)} pending" + (" (dry run)" if dry_run else ""))
 
@@ -66,19 +71,19 @@ from pyspark.sql import functions as F
 
 for migration in pending:
     statements = split_statements(render(migration.sql, values))
-    print(f"{migration.file}: {len(statements)} statement(s)")
+    print(f"{migration.path}: {len(statements)} statement(s)")
     if dry_run:
         continue
     for statement in statements:
         spark.sql(statement)
     # Recorded only after every statement in the file succeeded.
     (
-        spark.createDataFrame([(migration.version, migration.file, migration.checksum)], "version int, file string, checksum string")
+        spark.createDataFrame([(migration.key, migration.version, migration.path, migration.checksum)], "migration string, version int, file string, checksum string")
         .withColumn("applied_at", F.current_timestamp())
         .writeTo(history_table)
         .append()
     )
 
-summary = {"catalog": catalog, "dry_run": dry_run, "already_applied": len(applied), "applied_now": [] if dry_run else [m.file for m in pending], "pending": [m.file for m in pending] if dry_run else []}
+summary = {"catalog": catalog, "dry_run": dry_run, "already_applied": len(applied), "applied_now": [] if dry_run else [m.path for m in pending], "pending": [m.path for m in pending] if dry_run else []}
 print(summary)
 dbutils.notebook.exit(json.dumps(summary))
