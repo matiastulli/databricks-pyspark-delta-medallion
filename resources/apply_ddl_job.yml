@@ -1,0 +1,28 @@
+resources:
+  jobs:
+    apply_ddl:
+      name: apply_ddl
+      description: Applies pending DDL migrations from src/ddl/migrations. The only process that creates or changes tables
+      tags:
+        layer: ops
+
+      # Never two runners at once: both could apply the same migration.
+      max_concurrent_runs: 1
+
+      # No schedule or trigger: run it after `databricks bundle deploy`, before the pipelines.
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: bronze_schema
+          default: ${var.bronze_schema}
+        - name: silver_schema
+          default: ${var.silver_schema}
+        - name: gold_schema
+          default: ${var.gold_schema}
+        - name: dry_run
+          default: "false"
+
+      tasks:
+        - task_key: apply_ddl
+          notebook_task:
+            notebook_path: ../src/ops/apply_ddl.py

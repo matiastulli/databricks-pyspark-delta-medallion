@@ -253,12 +253,13 @@ Built:
   Jobs that create tables also need `CREATE` privileges they otherwise wouldn't.
 
 **Scope rule (the user's decision): DDL holds only the final tables.**
-- **In `ddl/`:** every table a process *publishes*, meaning the tables other processes, people or tools read: every bronze source table, silver `trips` and `trips_quarantine`, and the gold tables.
-- **Not in `ddl/`:** anything that only exists **during one transformation**, such as intermediate DataFrames, temporary views (`createOrReplaceTempView`) and CTEs. They belong to the process's code and disappear when the run ends.
+- **In `src/ddl/`:** every table a process *publishes*, meaning the tables other processes, people or tools read: every bronze source table, silver `trips` and `trips_quarantine`, and the gold tables.
+- **Not in `src/ddl/`:** anything that only exists **during one transformation**, such as intermediate DataFrames, temporary views (`createOrReplaceTempView`) and CTEs. They belong to the process's code and disappear when the run ends.
   - Today every intermediate step (`keyed`, `deduplicated`, `valid`/`rejected`, the aggregates before the checks) is already an in-memory DataFrame, so nothing moves out of the code.
-  - If a transformation ever needs a temporary **persisted** table (for example, to break up a very long plan), the job creates it and drops it at the end of the run, and it stays out of `ddl/`. Its name must make that clear, e.g. a `_tmp_` prefix.
+  - If a transformation ever needs a temporary **persisted** table (for example, to break up a very long plan), the job creates it and drops it at the end of the run, and it stays out of `src/ddl/`. Its name must make that clear, e.g. a `_tmp_` prefix.
 
 **Decisions (the user's):**
+- **Migrations live in `src/ddl/migrations/`,** inside `src/` next to the code that writes the tables, and deployed with it.
 - **Runner: a small in-repo runner,** not Flyway or Liquibase. It keeps the project PySpark-only and is small enough to test fully.
 - **Schemas move into a migration** (`V001__create_schemas.sql`), not the bundle's `schema` resource. We tested the bundle resource on Free Edition with a throwaway bundle, and it showed two problems:
   - **development mode renames the schemas:** `zz_schema_probe` was created as `medallion.dev_jmatiastulli_zz_schema_probe`, so in `dev` the bundle would create parallel schemas instead of adopting `00_bronze`, `01_silver` and `02_gold`
@@ -281,7 +282,7 @@ Built:
 | Bronze | `<source_system>_<source_table>` | `nyctaxi_trips`, `tpch_orders`, `tpch_customer` | Mirrors the source exactly, including its singular/plural. The system prefix prevents collisions when two systems have a table with the same name. |
 | Silver | `<entity>` as a plural noun, plus `<entity>_quarantine` for its rejected rows | `trips`, `trips_quarantine` | A cleaned, conformed business entity no longer belongs to one source system |
 | Gold | `fct_<event>` (one row per event), `dim_<entity>` (one row per entity), `agg_<subject>_<grain>` (aggregates and scorecards) | `agg_trips_daily`, `agg_trips_by_pickup_zip` | The prefix says how to use the table, the same convention as `fct_orders` / `dim_customers` in [dbt-terraform-postgres-medallion](https://github.com/matiastulli/dbt-terraform-postgres-medallion) |
-| Temporary (never in `ddl/`) | `_tmp_<process>_<purpose>`, created and dropped within one run | `_tmp_clean_trips_keyed` | Anything starting with `_tmp_` is safe to drop |
+| Temporary (never in `src/ddl/`) | `_tmp_<process>_<purpose>`, created and dropped within one run | `_tmp_clean_trips_keyed` | Anything starting with `_tmp_` is safe to drop |
 | Bookkeeping | `ops.<purpose>` | `ops.schema_migrations` | Owned by tooling, not by a pipeline |
 
 *Columns*
@@ -310,7 +311,7 @@ Built:
 `tpch_*`, silver `trips` and `trips_quarantine` already match. Code that follows the renames: `clean_trips.py` reads `nyctaxi_trips`, the `clean_trips` trigger watches `00_bronze.nyctaxi_trips`, the gold writes, and the docs. Verify on the workspace that the Delta history and data survive the rename, and that the trigger fires on the new name.
 
 Planned:
-- **`ddl/migrations/`: numbered, write-once SQL files** (Flyway style), for example:
+- **`src/ddl/migrations/`: numbered, write-once SQL files** (Flyway style), for example:
   ```
   V001__create_schemas.sql                    CREATE SCHEMA IF NOT EXISTS 00_bronze / 01_silver / 02_gold
   V002__create_bronze_trips.sql               baseline: the tables exactly as they exist today
@@ -326,7 +327,7 @@ Planned:
   A schema change is always a **new** file (e.g. `ALTER TABLE … ADD COLUMNS`). Applied files are never edited.
 - **Baseline first:** the tables already exist with data, so the first migrations must describe them **exactly as they are today** (columns, types, `NOT NULL`, comments). They adopt the tables without rewriting or losing data, and applying them is checked against `DESCRIBE TABLE`.
 - **A small migration runner** in `src/medallion/migrations.py` plus an `apply_ddl` workflow (serverless notebook, `spark.sql`):
-  - reads `ddl/migrations/*.sql` in version order
+  - reads `src/ddl/migrations/*.sql` in version order
   - records applied versions in `medallion.ops.schema_migrations` (`version`, `file`, `checksum`, `applied_at`). The runner creates that schema and table itself on its first run, like Flyway's history table, because it has to exist before any migration can be recorded.
   - applies only pending migrations, so reruns do nothing
   - **fails if an applied migration's file changed** (checksum mismatch), if two files share a version, or if a version is missing
