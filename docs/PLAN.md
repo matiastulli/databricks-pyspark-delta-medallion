@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** ✅ all steps done
+**Status:** steps 0–7 done · in progress: **step 8, table DDL as versioned migrations**
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -14,6 +14,7 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 5. CI/CD + orchestration | ✅ Done | A thin but working delivery path: high-risk logic tested in GitHub Actions, and an Asset Bundle job running bronze → silver → gold |
 | 6. Scale out | ✅ Done | Generic ingestion driven by `config/sources.toml`, one scheduled job per source, and silver/gold jobs triggered by table updates |
 | 7. Complete tests | ✅ Done | The rest of the transformations as pure functions, with full pytest coverage |
+| 8. DDL as migrations | ⏳ In progress | Tables created and changed only by versioned SQL migrations applied by an `apply_ddl` workflow; jobs stop creating tables |
 
 ## Constraints that shape every step
 
@@ -229,6 +230,128 @@ Built:
   - gold aggregates: daily sums and averages, and tied zones share a `dense_rank` with no gap after
   - quality: an empty silver fails instead of publishing an empty scorecard
 - **Verified on the workspace after the refactor:** `ingest_tpch_region`, `clean_trips` and `build_trip_metrics` all succeeded with the same results as before (21,847 trips, 85 quarantined, 13/13 checks, same top zones)
+
+## 8. Table DDL as versioned migrations, separate from the jobs ⏳
+
+**Goal:** tables are created and changed only by reviewed, versioned DDL, never by the jobs that write to them. The jobs load data into tables that already exist, and Delta rejects any write that doesn't match the declared schema.
+
+**Why:**
+- **It's a common production practice** (and the user's, from work): the schema is a contract with its own review, history and owner.
+- **The Databricks docs point the same way,** without naming one required pattern:
+  - [Schema enforcement](https://docs.databricks.com/aws/en/tables/schema-enforcement): every write must match the target table's columns and types, so a pre-created table protects its own schema
+  - [Schema evolution](https://docs.databricks.com/aws/en/tables/update-schema) should be explicit per write (`mergeSchema`, `MERGE WITH SCHEMA EVOLUTION`), never a session-wide setting
+  - [Asset Bundles](https://docs.databricks.com/aws/en/dev-tools/bundles/resources) can manage catalogs, schemas and volumes, but have **no table resource**
+  - [Terraform's `databricks_sql_table`](https://registry.terraform.io/providers/databricks/databricks/latest/docs/resources/sql_table) says it doesn't handle complex schema evolution and recommends migration tools like **Flyway or Liquibase**
+- **Today's weak spots:**
+
+  | Layer | How the table is created now | Problem |
+  |---|---|---|
+  | Bronze | `saveAsTable` infers the schema on the first write | Nobody reviews the schema |
+  | Silver | `CREATE TABLE IF NOT EXISTS` inside `clean_trips.py` | **Changing that DDL never alters the existing table** (`IF NOT EXISTS` skips it), so the code and the real table can silently drift apart |
+  | Gold | `overwrite` + `overwriteSchema=true` | Any run can change the table's schema, which turns off schema enforcement |
+
+  Jobs that create tables also need `CREATE` privileges they otherwise wouldn't.
+
+**Scope rule (the user's decision): DDL holds only the final tables.**
+- **In `ddl/`:** every table a process *publishes*, meaning the tables other processes, people or tools read: every bronze source table, silver `trips` and `trips_quarantine`, and the gold tables.
+- **Not in `ddl/`:** anything that only exists **during one transformation**, such as intermediate DataFrames, temporary views (`createOrReplaceTempView`) and CTEs. They belong to the process's code and disappear when the run ends.
+  - Today every intermediate step (`keyed`, `deduplicated`, `valid`/`rejected`, the aggregates before the checks) is already an in-memory DataFrame, so nothing moves out of the code.
+  - If a transformation ever needs a temporary **persisted** table (for example, to break up a very long plan), the job creates it and drops it at the end of the run, and it stays out of `ddl/`. Its name must make that clear, e.g. a `_tmp_` prefix.
+
+**Decisions (the user's):**
+- **Runner: a small in-repo runner,** not Flyway or Liquibase. It keeps the project PySpark-only and is small enough to test fully.
+- **Schemas move into a migration** (`V001__create_schemas.sql`), not the bundle's `schema` resource. We tested the bundle resource on Free Edition with a throwaway bundle, and it showed two problems:
+  - **development mode renames the schemas:** `zz_schema_probe` was created as `medallion.dev_jmatiastulli_zz_schema_probe`, so in `dev` the bundle would create parallel schemas instead of adopting `00_bronze`, `01_silver` and `02_gold`
+  - **`bundle destroy` dropped the schema together with a table holding data**
+
+  With a migration, a schema is only dropped by an explicit, reviewed migration. The **catalog** stays in `scripts/setup_unity_catalog.sh`, because Free Edition can't create it through the API.
+
+**Naming convention (declared for step 8; enforced by validation and tests where possible):**
+
+*Schemas*
+- Medallion layers: `NN_<layer>`, e.g. `00_bronze`, `01_silver`, `02_gold`. The number keeps pipeline order when sorted.
+- Anything else: a plain name, e.g. `ops` for pipeline bookkeeping such as the migration history.
+
+*Tables*
+- `snake_case`, matching `^[a-z][a-z0-9_]*$`, so table names never need quoting
+- **No layer in the table name**, because the schema already says it (not `bronze_trips`, not `stg_trips`)
+
+| Where | Pattern | Examples | Why |
+|---|---|---|---|
+| Bronze | `<source_system>_<source_table>` | `nyctaxi_trips`, `tpch_orders`, `tpch_customer` | Mirrors the source exactly, including its singular/plural. The system prefix prevents collisions when two systems have a table with the same name. |
+| Silver | `<entity>` as a plural noun, plus `<entity>_quarantine` for its rejected rows | `trips`, `trips_quarantine` | A cleaned, conformed business entity no longer belongs to one source system |
+| Gold | `fct_<event>` (one row per event), `dim_<entity>` (one row per entity), `agg_<subject>_<grain>` (aggregates and scorecards) | `agg_trips_daily`, `agg_trips_by_pickup_zip` | The prefix says how to use the table, the same convention as `fct_orders` / `dim_customers` in [dbt-terraform-postgres-medallion](https://github.com/matiastulli/dbt-terraform-postgres-medallion) |
+| Temporary (never in `ddl/`) | `_tmp_<process>_<purpose>`, created and dropped within one run | `_tmp_clean_trips_keyed` | Anything starting with `_tmp_` is safe to drop |
+| Bookkeeping | `ops.<purpose>` | `ops.schema_migrations` | Owned by tooling, not by a pipeline |
+
+*Columns*
+- Bronze keeps the **source column names untouched** (raw stays raw). Renaming happens in silver, e.g. `tpep_pickup_datetime` → `pickup_at`.
+- `_` prefix only for pipeline metadata: `_batch_id`, `_ingested_at`, `_source_table`, `_source_file`, `_merged_at`
+- Timestamps `<event>_at` (UTC), dates `<event>_date`
+- Measures carry their unit: `trip_distance_miles`, `trip_duration_minutes`
+- Money: `<name>_amount` as `DECIMAL`
+- Keys: `<entity>_id`, e.g. `trip_id`; booleans: `is_<state>` / `has_<thing>`
+
+*Migrations*
+- `V<NNN>__<verb>_<layer>_<table>.sql`, e.g. `V004__create_silver_trips.sql`, `V012__rename_gold_daily_trips.sql`
+
+*Enforcement*
+- Bronze targets are **derived** from the source instead of written by hand: `samples.nyctaxi.trips` → `nyctaxi_trips`. The `target` field leaves `config/sources.toml`, which removes one thing to get wrong (tested).
+- The runner rejects migration files that don't match the file-name pattern (tested)
+
+**Renames this convention requires**, applied as migrations (`ALTER TABLE … RENAME TO`), after the baseline:
+
+| Today | After |
+|---|---|
+| `00_bronze.trips` | `00_bronze.nyctaxi_trips` |
+| `02_gold.daily_trips` | `02_gold.agg_trips_daily` |
+| `02_gold.busiest_pickup_zones` | `02_gold.agg_trips_by_pickup_zip` |
+
+`tpch_*`, silver `trips` and `trips_quarantine` already match. Code that follows the renames: `clean_trips.py` reads `nyctaxi_trips`, the `clean_trips` trigger watches `00_bronze.nyctaxi_trips`, the gold writes, and the docs. Verify on the workspace that the Delta history and data survive the rename, and that the trigger fires on the new name.
+
+Planned:
+- **`ddl/migrations/`: numbered, write-once SQL files** (Flyway style), for example:
+  ```
+  V001__create_schemas.sql                    CREATE SCHEMA IF NOT EXISTS 00_bronze / 01_silver / 02_gold
+  V002__create_bronze_trips.sql               baseline: the tables exactly as they exist today
+  V003__create_bronze_tpch_region.sql …
+  V010__create_silver_trips.sql
+  V011__create_silver_trips_quarantine.sql
+  V012__create_gold_daily_trips.sql
+  V013__create_gold_busiest_pickup_zones.sql
+  V014__rename_bronze_trips.sql               then the naming convention renames
+  V015__rename_gold_daily_trips.sql
+  V016__rename_gold_busiest_pickup_zones.sql
+  ```
+  A schema change is always a **new** file (e.g. `ALTER TABLE … ADD COLUMNS`). Applied files are never edited.
+- **Baseline first:** the tables already exist with data, so the first migrations must describe them **exactly as they are today** (columns, types, `NOT NULL`, comments). They adopt the tables without rewriting or losing data, and applying them is checked against `DESCRIBE TABLE`.
+- **A small migration runner** in `src/medallion/migrations.py` plus an `apply_ddl` workflow (serverless notebook, `spark.sql`):
+  - reads `ddl/migrations/*.sql` in version order
+  - records applied versions in `medallion.ops.schema_migrations` (`version`, `file`, `checksum`, `applied_at`). The runner creates that schema and table itself on its first run, like Flyway's history table, because it has to exist before any migration can be recorded.
+  - applies only pending migrations, so reruns do nothing
+  - **fails if an applied migration's file changed** (checksum mismatch), if two files share a version, or if a version is missing
+- **Jobs stop creating tables:**
+  - `clean_trips.py` loses its `CREATE TABLE` cells
+  - `build_trip_metrics.py` overwrites data without `overwriteSchema`
+  - `ingest.py` writes into pre-created tables
+  - A missing table or a mismatched schema fails the run with a clear error
+- **Deploy order (CD stays on the laptop):** `databricks bundle deploy` → `databricks bundle run apply_ddl` → pipelines
+- **High-risk tests:**
+  - the runner's logic: version ordering such as `V2` before `V10`, only pending migrations run, and checksum drift, duplicate or missing versions and bad file names all fail
+  - bronze target names derived from the source
+  - the rest of the runner goes in the full test suite as before
+- **Get it working early:**
+  1. Run the runner with the baseline migrations against the existing tables and confirm nothing changes (schemas identical, row counts intact)
+  2. Remove table creation from one job, run it, and confirm the results are unchanged
+  3. Force a mismatched write and confirm Delta rejects it
+  4. Apply the renames and confirm data, history and the `clean_trips` trigger survive
+  5. Then do the remaining jobs
+
+Confirmed by the user:
+- **Bronze DDL:** bronze tables are final tables, so they get migrations, generated per source by `scripts/new_bronze_migration.py <source>`. The script reads the source table's schema, adds the metadata columns, and writes the next numbered migration with the conventional name for review.
+- **The naming convention** above, including the gold `fct_` / `dim_` / `agg_` prefixes and the three renames.
+
+Note: **least privilege** can only be documented here, not demonstrated. Free Edition has a single user, so the jobs and the migration runner run as the same identity.
 
 ---
 
