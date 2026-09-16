@@ -144,5 +144,5 @@ Planned:
 ## How to keep this file current
 
 - When a step lands: change its status in the table and in its heading, move "Planned" to what was built, and note decisions and anything learned
-- Tick the same step off in the README's learning path
+- This file is the only plan. The README describes what exists (getting started, layers) and links here
 - When a later step's plan changes, edit it here before writing the code

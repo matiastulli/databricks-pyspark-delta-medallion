@@ -2,21 +2,9 @@
 
 A medallion lakehouse on **Databricks**, built with **PySpark** and **Delta Lake**, orchestrated with **Databricks Asset Bundles** and tested with **pytest**.
 
-> 🚧 **Built step by step as a learning path.** Each step below is added in its own commits, so the history shows how the lakehouse grows.
+> 🚧 **Built step by step as a learning path.** Each step lands in its own commits, so the history shows how the lakehouse grows. The steps, their status and the decisions behind them are in [docs/PLAN.md](docs/PLAN.md).
 
 The data is the [NYC taxi trips](https://docs.databricks.com/aws/en/discover/databricks-datasets) sample that ships with every Databricks workspace (`samples.nyctaxi.trips`). It's simple, well-known data, so the focus stays on the engineering rather than on business rules.
-
-## Learning path
-
-The detailed plan, with decisions and what each step learned, is in [docs/PLAN.md](docs/PLAN.md).
-
-- [x] **0. Local environment:** PySpark + Delta Lake on a laptop (Java 17), with a local Delta `MERGE` checked end to end
-- [x] **1. Setup:** Databricks Free Edition, CLI authentication, Unity Catalog catalog with `00_bronze` / `01_silver` / `02_gold` schemas
-- [x] **2. Bronze:** ingest raw trips into Delta with PySpark, adding ingestion metadata
-- [x] **3. Silver:** clean and type the data, with an idempotent Delta `MERGE`
-- [ ] **4. Gold:** daily trips and revenue, busiest pickup zones, and data quality checks that fail the run
-- [ ] **5. Orchestration:** a Databricks Asset Bundle job running bronze → silver → gold
-- [ ] **6. Tests + CI:** transformations as pure functions, unit-tested with pytest, run by GitHub Actions
 
 ## Getting started
 
