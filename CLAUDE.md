@@ -23,7 +23,7 @@ Learning path (tick them off in `README.md` as they land):
 - Databricks CLI (Homebrew). Authenticate with `databricks auth login` (browser OAuth). **Never ask for or handle personal access tokens in chat.** The CLI uses the `DEFAULT` profile in `~/.databrickscfg`. Keep the workspace host out of committed files.
 - Workspace-specific settings (`DATABRICKS_HOST`, `DATABRICKS_CONFIG_PROFILE`, `DATABRICKS_WAREHOUSE_ID`) and the catalog/schema names live in `.env`, which is git-ignored. `.env.example` is the committed template. Add new variables to both files, and only when code uses them. Never put tokens in `.env`, because auth is OAuth.
 - Unity Catalog: catalog `medallion` with schemas `00_bronze`, `01_silver`, `02_gold`. The user chose these names so the schemas sort in pipeline order. Unquoted names like `medallion.00_bronze.trips` parse fine (checked on the warehouse), and the setup script quotes them with backticks anyway. Free Edition's metastore has no storage root, so `databricks catalogs create` fails. Create catalogs with SQL on the serverless warehouse, which uses Default Storage. The only warehouse is the "Serverless Starter Warehouse". Stop it after ad-hoc SQL to save quota.
-- Local: Python 3.11 and Java 17 (Homebrew `openjdk@17`). Versions are pinned in `requirements.txt` (PySpark 4.2.0 + delta-spark 4.4.0) and were verified together locally. The Databricks serverless runtime may differ, so align the pins once the workspace exists.
+- Local: Python 3.11 and Java 17 (Homebrew `openjdk@17`). Versions are pinned in `requirements.txt` (PySpark 4.2.0 + delta-spark 4.4.0) and were verified together locally. They match serverless compute, which was checked in step 2 and runs Spark 4.2.0 on Python 3.11. Re-check if the serverless environment changes.
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
@@ -42,7 +42,12 @@ databricks current-user me                                   # check the auth wo
 scripts/setup_unity_catalog.sh                               # idempotent, reads .env: catalog + 00_bronze/01_silver/02_gold schemas
 databricks schemas list "$CATALOG"
 databricks warehouses stop "$DATABRICKS_WAREHOUSE_ID" --no-wait   # stop after ad-hoc SQL to save quota
+scripts/run_notebook.sh 00_bronze                            # upload notebooks/00_bronze.py and run it once on serverless, then print its exit JSON
 ```
+
+Notebooks live in `notebooks/` as Databricks source files (`# Databricks notebook source`, `# COMMAND ----------` between cells). They read the catalog and schema names from widgets, which `run_notebook.sh` fills in from `.env`. `run_notebook.sh` uses `databricks jobs submit` (a one-time run with no saved job) as a stopgap until the Asset Bundle in step 5.
+
+Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no nulls. The columns are `tpep_pickup_datetime`, `tpep_dropoff_datetime`, `trip_distance`, `fare_amount`, `pickup_zip`, `dropoff_zip`. There is **no trip ID**, and zones are ZIP codes. Bronze (`medallion.00_bronze.trips`) is append-only, so every run adds a full batch under a new `_batch_id`.
 
 ## Working agreements
 
