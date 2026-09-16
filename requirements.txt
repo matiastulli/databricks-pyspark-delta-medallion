@@ -3,3 +3,5 @@
 pyspark==4.2.0
 delta-spark==4.4.0
 pytest==9.1.1
+# Python-defined bundle resources (resources/__init__.py); keep in step with the Databricks CLI version.
+databricks-bundles==1.16.1

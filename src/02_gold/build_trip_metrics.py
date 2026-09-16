@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 02 · Gold: aggregates, checked before they're published
+# MAGIC # Build trip metrics (gold): aggregates, checked before they're published
 # MAGIC
 # MAGIC Builds two tables in `<catalog>.<gold_schema>` from `<catalog>.<silver_schema>.trips`:
 # MAGIC
@@ -15,6 +15,15 @@
 # MAGIC
 # MAGIC Gold is rebuilt in full every run (Delta overwrite). The aggregates are tiny, and a Delta overwrite is
 # MAGIC atomic: readers see either the old table or the new one, never a half-written one.
+
+# COMMAND ----------
+
+# Make src/medallion importable: a notebook runs with its own folder (src/<schema>/) as the working
+# directory, so the shared package is one level up.
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(".."))
 
 # COMMAND ----------
 

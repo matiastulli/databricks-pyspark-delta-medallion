@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 01 · Silver: clean, typed, one row per trip
+# MAGIC # Clean trips (silver): clean, typed, one row per trip
 # MAGIC
 # MAGIC Reads `<catalog>.<bronze_schema>.trips` and merges it into two tables in `<catalog>.<silver_schema>`:
 # MAGIC `trips` for the clean trips and `trips_quarantine` for the rejected ones.
@@ -19,6 +19,15 @@
 # MAGIC    to update. Only new trips are inserted, so running the notebook again changes nothing.
 # MAGIC
 # MAGIC Every run reads all of bronze. At ~22k trips per batch that's cheap, and it keeps the logic simple.
+
+# COMMAND ----------
+
+# Make src/medallion importable: a notebook runs with its own folder (src/<schema>/) as the working
+# directory, so the shared package is one level up.
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(".."))
 
 # COMMAND ----------
 

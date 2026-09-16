@@ -15,7 +15,8 @@ Learning path. `docs/PLAN.md` is the only place that tracks it: update its statu
 3. Silver: cleaning/typing, idempotent Delta `MERGE`
 4. Gold: aggregates (daily trips/revenue, busiest zones) + data quality checks that fail the run
 5. CI/CD + orchestration, thin and early: high-risk logic as pure functions in `src/` with a few pytest tests, GitHub Actions, and a Databricks Asset Bundle (`databricks.yml`) job running bronze → silver → gold for real
-6. Complete tests: the remaining transformations and edge cases
+6. Scale out: generic `00_bronze/ingest.py` driven by `config/sources.toml` (nyctaxi + TPC-H), one generated, scheduled job per source, and silver/gold jobs on table update triggers; `src/` folders per schema, notebooks named by process
+7. Complete tests: the remaining transformations and edge cases
 
 ## Environment
 
@@ -42,9 +43,13 @@ databricks current-user me                                   # check the auth wo
 scripts/setup_unity_catalog.sh                               # idempotent, reads .env: catalog + 00_bronze/01_silver/02_gold schemas
 databricks schemas list "$CATALOG"
 databricks warehouses stop "$DATABRICKS_WAREHOUSE_ID" --no-wait   # stop after ad-hoc SQL to save quota
-databricks bundle validate                                   # checks databricks.yml + resources/ (host comes from the DEFAULT profile)
-databricks bundle deploy                                     # dev target: job "[dev <user>] medallion", files under ~/.bundle/
-databricks bundle run medallion                              # waits, prints each task's exit JSON; silver must report rows_inserted: 0 on reruns
+databricks bundle validate                                   # also runs resources/__init__.py (needs .venv with databricks-bundles)
+databricks bundle validate -o json                           # inspect generated jobs, schedules, triggers and pause status
+databricks bundle deploy                                     # dev target: jobs "[dev <user>] <name>", every schedule and trigger PAUSED
+databricks bundle run ingest_trips                           # any ingest_<source>; prints the notebook's exit JSON
+databricks bundle run clean_trips                            # must report rows_inserted: 0 on reruns
+databricks bundle run build_trip_metrics                     # fails with DataQualityError if a check fails
+databricks jobs list-runs --job-id <id> --limit 3            # the run's `trigger` field shows TABLE / PERIODIC / ONE_TIME
 ```
 
 Tests (local PySpark, no Delta and no workspace needed). CI (`.github/workflows/ci.yml`) runs the same on pushes to main and on PRs:
@@ -55,7 +60,21 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 .venv/bin/pytest tests/test_silver.py -k time_zone           # single test
 ```
 
-Layout: notebooks are Databricks source files (`# Databricks notebook source`, `# COMMAND ----------` between cells) in `src/` next to the `src/medallion/` package they import. On serverless a notebook's own folder is on `sys.path`, so `from medallion.silver import ...` works without path hacks (verified with a bundle run). Notebooks read the catalog and schema names from widgets, which the job fills in through job parameters from the bundle variables. `src/medallion/` holds the pure, unit-tested logic: `silver.py` (`add_trip_id`, `keep_first_load`, `split_valid_and_rejected`) and `quality.py` (`gold_checks`, `raise_if_any_failed`). Notebooks keep only the table reads and writes, the typing/aggregation not yet extracted, and the orchestration. Each job run appends another full bronze batch, which is expected.
+Layout: notebooks are Databricks source files (`# Databricks notebook source`, `# COMMAND ----------` between cells). `src/` has **one folder per schema** (`00_bronze/`, `01_silver/`, `02_gold/`, as the user chose), holding the processes that write to that schema. Processes are **named after what they do** (`ingest.py`, `clean_trips.py`, `build_trip_metrics.py`), never after the schema. On serverless a notebook's working directory is its own folder, so each notebook starts with a cell doing `sys.path.insert(0, os.path.abspath(".."))` to import the shared `src/medallion/` package (verified with a bundle run). Notebooks read the catalog and schema names from widgets, which the job fills in through job parameters from the bundle variables.
+
+`src/medallion/` holds the pure, unit-tested logic:
+- `sources.py`: `load_sources`, `get_source`, `parse_sources`, which validates `config/sources.toml`
+- `silver.py`: `add_trip_id`, `keep_first_load`, `split_valid_and_rejected`
+- `quality.py`: `gold_checks`, `raise_if_any_failed`
+
+**One workflow per process** (the user's production practice):
+- Bronze is config-driven. `config/sources.toml` lists every source (`name`, `table`, `target`, `mode` = `append` | `overwrite`, `schedule` = Quartz cron in UTC).
+- `resources/__init__.py` (Python-defined bundle resources, `databricks-bundles` pinned to the CLI version) generates one job `ingest_<name>` per entry. Each job runs `00_bronze/ingest.py` with job parameter `source` on its own schedule.
+- `clean_trips` (silver) and `build_trip_metrics` (gold scorecard) are YAML jobs with **table update triggers** on their input table.
+- Add a bronze table by adding a config entry. Never add a notebook or job YAML for it, and never put all sources in one job.
+- Table update triggers fire only on data changes: a MERGE that inserts 0 rows commits a version but doesn't trigger downstream. This was verified on Free Edition by unpausing temporarily.
+- To test a trigger in dev, unpause it with `databricks jobs update` and pause it again afterwards, because development mode deploys it paused.
+- `samples.tpch.lineitem` (30M rows) is left out to protect Free Edition quota.
 
 Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no nulls. The columns are `tpep_pickup_datetime`, `tpep_dropoff_datetime`, `trip_distance`, `fare_amount`, `pickup_zip`, `dropoff_zip`. There is **no trip ID**, and zones are ZIP codes. Bronze (`medallion.00_bronze.trips`) is append-only, so every run adds a full batch under a new `_batch_id`. Silver (`medallion.01_silver.trips`) keys trips by `trip_id` = SHA-256 of the six source columns, with timestamps as `unix_micros` so the key doesn't depend on the time zone. Its `MERGE` is insert-only, because a matching key means identical content. Rejected trips go to `medallion.01_silver.trips_quarantine`, keeping their bronze columns and adding `rejection_reasons`. Every distinct trip lands in exactly one of the two tables, and the notebook asserts that. Gold (`medallion.02_gold.daily_trips`, `busiest_pickup_zones`) runs in the order compute → data quality checks → overwrite, so a failing check raises `DataQualityError` before any write. Don't use `.cache()`/`.persist()` in notebooks: Databricks documents DataFrame caching as unsupported on serverless (not tested here).
 

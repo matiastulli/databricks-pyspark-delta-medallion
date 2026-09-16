@@ -1,0 +1,30 @@
+resources:
+  jobs:
+    build_trip_metrics:
+      name: build_trip_metrics
+      description: Gold scorecard. Daily trips and busiest pickup zones, published only if every data quality check passes
+      tags:
+        layer: gold
+
+      # Runs whenever clean_trips writes to silver trips. Paused in the dev target.
+      trigger:
+        table_update:
+          table_names:
+            - ${var.catalog}.${var.silver_schema}.trips
+          condition: ANY_UPDATED
+          wait_after_last_change_seconds: 60
+
+      max_concurrent_runs: 1
+
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: silver_schema
+          default: ${var.silver_schema}
+        - name: gold_schema
+          default: ${var.gold_schema}
+
+      tasks:
+        - task_key: build_trip_metrics
+          notebook_task:
+            notebook_path: ../src/02_gold/build_trip_metrics.py

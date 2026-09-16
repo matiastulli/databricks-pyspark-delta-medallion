@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–5 done · next up: **step 6, complete the test suite**
+**Status:** steps 0–6 done · next up: **step 7, complete the test suite**
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -12,7 +12,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 3. Silver | ✅ Done | Cleaned, typed, deduplicated trips via an idempotent `MERGE` |
 | 4. Gold | ✅ Done | Daily and per-zone aggregates, plus data quality checks that fail the run |
 | 5. CI/CD + orchestration | ✅ Done | A thin but working delivery path: high-risk logic tested in GitHub Actions, and an Asset Bundle job running bronze → silver → gold |
-| 6. Complete tests | ⏳ Next | The rest of the transformations as pure functions, with full pytest coverage |
+| 6. Scale out | ✅ Done | Generic ingestion driven by `config/sources.toml`, one scheduled job per source, and silver/gold jobs triggered by table updates |
+| 7. Complete tests | ⏳ Next | The rest of the transformations as pure functions, with full pytest coverage |
 
 ## Constraints that shape every step
 
@@ -35,6 +36,7 @@ How this project is built, one step at a time. Each step lands in its own commit
 ```
 medallion                  catalog (Default Storage)
 ├── 00_bronze.trips        raw, append-only                  step 2
+│   00_bronze.tpch_*       7 TPC-H snapshots (overwrite)     step 6
 ├── 01_silver.trips        clean, one row per trip           step 3
 └── 02_gold.*              aggregates                        step 4
 ```
@@ -158,9 +160,61 @@ Built, in the order that got the path working soonest:
 - **The package stays `medallion`, not `tests`.** It's production logic that the job runs. `tests/` holds the pytest tests that check it.
 - **Bronze appends a full batch on every job run.** That's by design: silver deduplicates. Five batches are loaded so far.
 
-## 6. Complete the test suite ⏳
+## 6. Scale out: config-driven ingestion, one workflow per process ✅
 
-**Goal:** fill in the tests that step 5 deliberately skipped.
+**Goal:** a production-shaped structure that grows to many tables without growing the code.
+- Each source is ingested by **its own workflow, on its own cadence** (daily, biweekly, monthly…)
+- Silver transformations and gold scorecards are **separate workflows that react to their input tables**, instead of one DAG that runs everything at once
+
+**Why:**
+- One notebook per layer, named after its schema, mixes up *where data lives* with *what the code does*.
+- One job that ingests every source at the same moment doesn't match production: sources arrive on different cadences, and one failure or retry shouldn't block unrelated sources. Silver shouldn't wait for bronze tables it doesn't read.
+
+Built:
+- **Folders per schema, processes named by what they do:** `src/00_bronze/ingest.py`, `src/01_silver/clean_trips.py`, `src/02_gold/build_trip_metrics.py`, with the shared logic in `src/medallion/`. A notebook's working directory is its own folder on serverless, so each notebook adds `src/` to `sys.path` in its first code cell.
+- **[`config/sources.toml`](../config/sources.toml)** lists every bronze source: `name`, `table`, `target`, `mode`
+  - `trips` uses `append`
+  - 7 TPC-H tables use `overwrite` (full snapshots)
+  - `lineitem` (30M rows) is left out to protect Free Edition quota
+- **One generic [`ingest.py`](../src/00_bronze/ingest.py)**, parameterized by `source`
+- **Config validation** in [`src/medallion/sources.py`](../src/medallion/sources.py), with 7 tests: required and unknown keys, identifiers, `catalog.schema.table`, known `mode`, unique names and targets, and the committed config is valid
+
+Tried first, then replaced: one job with a `list_sources` task and a `for_each_task` fanning `ingest.py` out over every source. It worked (8/8 iterations, row counts matched, `overwrite` stayed at one batch on rerun). But it runs every source at the same moment, which is the problem described above.
+
+Built on top:
+- **`schedule` per source** in [`config/sources.toml`](../config/sources.toml) (Quartz cron, UTC). The cadences are illustrative:
+  - `trips`, `tpch_customer`, `tpch_orders`: daily
+  - `tpch_supplier`, `tpch_part`, `tpch_partsupp`: twice a month, on the 1st and 15th (Quartz has no "every 14 days")
+  - `tpch_region`, `tpch_nation`: monthly
+  - Validation rejects a 5-field Unix cron, the usual mistake (1 more test, 8 in total for the config)
+- **One ingestion job per source, generated** by [`resources/__init__.py`](../resources/__init__.py) with Python-defined bundle resources (`databricks-bundles==1.16.1`, matching the CLI)
+  - It reuses the validated config loader, so a bad config fails `bundle validate`
+  - Each job `ingest_<name>` runs `src/00_bronze/ingest.py` with job parameter `source`, on its own schedule
+  - `list_sources.py` and the single `medallion` job with its `for_each_task` are removed
+- **[`clean_trips`](../resources/clean_trips_job.yml)** (silver) with a table update trigger on `00_bronze.trips`
+- **[`build_trip_metrics`](../resources/build_trip_metrics_job.yml)** (gold scorecard) with a table update trigger on `01_silver.trips`
+- All 10 jobs are deployed. In `dev`, development mode pauses every schedule and trigger.
+
+Verified on Free Edition (both capabilities work):
+- `bundle validate -o json` showed the 8 generated ingestion jobs with their schedules, and the two triggers, all `PAUSED`
+- **The silver trigger fired:** with the triggers temporarily unpaused, running only `ingest_trips` started `clean_trips` by itself about 75 seconds later (`trigger: TABLE`, the 60-second settle time plus evaluation). It succeeded and inserted 0 rows.
+- **Gold did not start after that**, which is correct. The 0-row `MERGE` committed a Delta version with no files added, and table update triggers only fire on data changes, so the scorecard doesn't rebuild when silver didn't change.
+- **The gold trigger fired on a real change,** in a test that repaired itself:
+  - deleting one silver trip triggered `build_trip_metrics` (`TABLE`), and its checks passed against the 21,846 remaining rows
+  - running `clean_trips` re-inserted exactly that trip (`rows_inserted: 1`, back to 21,847), which triggered gold again
+- Both triggers were paused again afterwards
+
+**Decisions:**
+- **One workflow per process,** following production practice. Each source is ingested on its own cadence, silver transformations run per entity, and each gold scorecard is its own workflow. Failures, retries and schedules don't couple unrelated data.
+- **Generic code, generated workflows.** One `ingest.py` for every source, plus one job per source generated from the config, so 40 tables means 40 config entries and still no per-source code or YAML.
+- **Event-driven downstream.** Silver and gold react to their input tables instead of guessing when bronze finished on their own schedules. Downstream processes don't know about upstream jobs.
+- **The load mode is per source.** `append` keeps history for data that needs deduplication, and `overwrite` suits reference snapshots and keeps Free Edition storage flat.
+- **Folders mirror the schemas, and files name the process** (the user's call).
+- **Not built yet:** silver and gold for TPC-H, and generic silver helpers parameterized per entity. They come when a second entity actually needs silver.
+
+## 7. Complete the test suite ⏳
+
+**Goal:** fill in the tests that steps 5 and 6 deliberately skipped.
 
 Planned:
 - Move the remaining transformations into `src/medallion/` (bronze metadata columns, silver typing and renaming, gold aggregates) and test them

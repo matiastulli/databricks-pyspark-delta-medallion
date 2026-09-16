@@ -1,8 +1,10 @@
 # Databricks Asset Bundle: deploys the medallion pipeline as one job.
 #
 #   databricks bundle validate
-#   databricks bundle deploy          # dev is the default target
-#   databricks bundle run medallion   # waits for the run and fails if any task fails
+#   databricks bundle deploy                  # dev is the default target
+#   databricks bundle run ingest_trips        # one ingestion job per source in config/sources.toml
+#   databricks bundle run clean_trips         # silver (triggered by bronze trips updates outside dev)
+#   databricks bundle run build_trip_metrics  # gold scorecard (triggered by silver trips updates outside dev)
 #
 # The workspace host is deliberately not set here (this repo is public): the CLI takes it from the
 # DEFAULT profile in ~/.databrickscfg, or from DATABRICKS_HOST.
@@ -11,6 +13,13 @@ bundle:
 
 include:
   - resources/*.yml
+
+# Ingestion jobs are generated in Python from config/sources.toml (resources/__init__.py), one per source.
+# The CLI runs this with the project venv, which needs `databricks-bundles` (in requirements.txt).
+python:
+  venv_path: .venv
+  resources:
+    - "resources:load_resources"
 
 # Override any of these per run with --var, e.g. --var catalog=my_catalog, or with BUNDLE_VAR_catalog.
 variables:
@@ -26,7 +35,7 @@ variables:
 
 targets:
   dev:
-    # Development mode: deploys under your user folder, prefixes the job name with "[dev <user>]",
-    # and pauses any schedules, so nothing runs (or spends Free Edition quota) on its own.
+    # Development mode: deploys under your user folder, prefixes job names with "[dev <user>]",
+    # and pauses every schedule and trigger, so nothing runs (or spends Free Edition quota) on its own.
     mode: development
     default: true
