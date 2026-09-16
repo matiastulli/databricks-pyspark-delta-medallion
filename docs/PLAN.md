@@ -2,15 +2,15 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–2 done · next up: **step 3, Silver**
+**Status:** steps 0–3 done · next up: **step 4, Gold**
 
 | Step | Status | What it delivers |
 |---|---|---|
 | 0. Local environment | ✅ Done | PySpark + Delta Lake running on the laptop |
 | 1. Setup | ✅ Done | Databricks Free Edition workspace, CLI auth, Unity Catalog catalog and schemas |
 | 2. Bronze | ✅ Done | Raw trips appended into Delta, with ingestion metadata |
-| 3. Silver | ⏳ Next | Cleaned, typed, deduplicated trips via an idempotent `MERGE` |
-| 4. Gold | 🔜 Planned | Daily and per-zone aggregates, plus data quality checks that fail the run |
+| 3. Silver | ✅ Done | Cleaned, typed, deduplicated trips via an idempotent `MERGE` |
+| 4. Gold | ⏳ Next | Daily and per-zone aggregates, plus data quality checks that fail the run |
 | 5. Orchestration | 🔜 Planned | A Databricks Asset Bundle job running bronze → silver → gold |
 | 6. Tests + CI | 🔜 Planned | Transformations as pure functions, pytest, GitHub Actions |
 
@@ -77,25 +77,34 @@ Each schema name starts with its layer number, so the schemas sort in pipeline o
 - **Append-only.** Rerunning adds the same trips again under a new `_batch_id`. Bronze keeps the full load history, and deduplication belongs to silver. Two runs are loaded so far (43,864 rows, 2 batches), which gives step 3 real duplicates to handle.
 - **Versions checked:** serverless compute runs Spark 4.2.0 on Python 3.11, matching the local pins.
 
-## 3. Silver ⏳
+## 3. Silver ✅
 
 **Goal:** one clean, correctly typed row per trip, and reruns that change nothing.
 
-Planned:
-- `notebooks/01_silver.py` reads bronze and writes `medallion.01_silver.trips`
-- **Key:** the source has no ID, so build `trip_id` as a hash (`sha2`) of the six source columns. Identical trips from different bronze batches get the same key.
-- **Deduplicate** within the input on `trip_id`, keeping the most recent `_ingested_at`
-- **Clean** with simple, readable rules, for example:
-  - drop trips with a non-positive distance or fare
-  - drop trips whose dropoff is before the pickup
-  - derive `pickup_date` and `trip_duration_minutes`
-- **Delta `MERGE`** into silver on `trip_id`: update matched rows, insert new ones. Running it twice must leave the row count unchanged, and the notebook checks that.
+- [`notebooks/01_silver.py`](../notebooks/01_silver.py) reads all of bronze and merges into `medallion.01_silver.trips` (valid trips) and `medallion.01_silver.trips_quarantine` (rejected trips)
+- Both tables are created up front with explicit types, `NOT NULL` and column comments, because silver's schema is a contract for gold
+- **Key:** `trip_id` = SHA-256 of the six source columns. Timestamps go in as `unix_micros`, because their string form depends on the session time zone.
+- **Deduplicate** on `trip_id`, keeping the first load (earliest `_ingested_at`). 43,864 bronze rows became exactly the source's 21,932 trips.
+- **Validate:** each trip gets `rejection_reasons`, the names of the rules it breaks: a distance of 0 or less (76), a fare of 0 or less (10), a dropoff not after the pickup (1). The 85 rejected trips (2 broke two rules) go to quarantine with their bronze columns and types untouched.
+- **Type and rename:**
+  - `pickup_at` / `dropoff_at`
+  - `pickup_date` and `trip_duration_minutes`, both derived
+  - `trip_distance_miles`
+  - `fare_amount` as `DECIMAL(10,2)`
+  - ZIPs as zero-padded strings: New Jersey's `7002` becomes `07002`
+- **Insert-only `MERGE`** on `trip_id` into both tables → 21,847 in silver, 85 in quarantine
+- **Reconciliation checks** that fail the run:
+  - `trip_id` is unique in each table
+  - no `trip_id` appears in both tables
+  - silver plus quarantine equals the number of distinct bronze trips
 
-Open questions:
-- Should silver read all of bronze or only batches it hasn't processed yet? Reading everything is simplest at this size, while tracking processed batches teaches incremental loading.
-- Should rejected rows be dropped, or kept in a quarantine table?
+**Decisions:**
+- **Insert-only merge, no update clause.** The key hashes every source column, so a matched `trip_id` means identical content. Running it again inserted 0 rows into each table, which the Delta history shows (`MERGE` with 21,847 inserted, then 0).
+- **Read all of bronze on every run**, rather than tracking processed batches. At this size it's cheap, and incremental loading can come later if it's worth learning.
+- **Quarantine rejected rows** instead of dropping them. Nothing disappears silently, and the quarantine can be queried to see why each trip was rejected. It keeps bronze's raw types, because the rows failed before typing.
+- Trips over 3 hours (33) are kept. They're suspicious but not impossible, and gold can decide whether they matter.
 
-## 4. Gold 🔜
+## 4. Gold ⏳
 
 **Goal:** tables that answer questions directly, plus a run that fails loudly when the data is wrong.
 

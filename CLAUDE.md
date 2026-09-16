@@ -43,11 +43,12 @@ scripts/setup_unity_catalog.sh                               # idempotent, reads
 databricks schemas list "$CATALOG"
 databricks warehouses stop "$DATABRICKS_WAREHOUSE_ID" --no-wait   # stop after ad-hoc SQL to save quota
 scripts/run_notebook.sh 00_bronze                            # upload notebooks/00_bronze.py and run it once on serverless, then print its exit JSON
+scripts/run_notebook.sh 01_silver                            # rerunning must report rows_inserted: 0 for silver and quarantine
 ```
 
 Notebooks live in `notebooks/` as Databricks source files (`# Databricks notebook source`, `# COMMAND ----------` between cells). They read the catalog and schema names from widgets, which `run_notebook.sh` fills in from `.env`. `run_notebook.sh` uses `databricks jobs submit` (a one-time run with no saved job) as a stopgap until the Asset Bundle in step 5.
 
-Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no nulls. The columns are `tpep_pickup_datetime`, `tpep_dropoff_datetime`, `trip_distance`, `fare_amount`, `pickup_zip`, `dropoff_zip`. There is **no trip ID**, and zones are ZIP codes. Bronze (`medallion.00_bronze.trips`) is append-only, so every run adds a full batch under a new `_batch_id`.
+Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no nulls. The columns are `tpep_pickup_datetime`, `tpep_dropoff_datetime`, `trip_distance`, `fare_amount`, `pickup_zip`, `dropoff_zip`. There is **no trip ID**, and zones are ZIP codes. Bronze (`medallion.00_bronze.trips`) is append-only, so every run adds a full batch under a new `_batch_id`. Silver (`medallion.01_silver.trips`) keys trips by `trip_id` = SHA-256 of the six source columns, with timestamps as `unix_micros` so the key doesn't depend on the time zone. Its `MERGE` is insert-only, because a matching key means identical content. Rejected trips go to `medallion.01_silver.trips_quarantine`, keeping their bronze columns and adding `rejection_reasons`. Every distinct trip lands in exactly one of the two tables, and the notebook asserts that.
 
 ## Working agreements
 
