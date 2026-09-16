@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–7 done · in progress: **step 8, table DDL as versioned migrations**
+**Status:** ✅ all steps done
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -14,7 +14,7 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 5. CI/CD + orchestration | ✅ Done | A thin but working delivery path: high-risk logic tested in GitHub Actions, and an Asset Bundle job running bronze → silver → gold |
 | 6. Scale out | ✅ Done | Generic ingestion driven by `config/sources.toml`, one scheduled job per source, and silver/gold jobs triggered by table updates |
 | 7. Complete tests | ✅ Done | The rest of the transformations as pure functions, with full pytest coverage |
-| 8. DDL as migrations | ⏳ In progress | Tables created and changed only by versioned SQL migrations applied by an `apply_ddl` workflow; jobs stop creating tables |
+| 8. DDL as migrations | ✅ Done | Tables created and changed only by versioned SQL migrations applied by an `apply_ddl` workflow; jobs stop creating tables |
 
 ## Constraints that shape every step
 
@@ -231,7 +231,7 @@ Built:
   - quality: an empty silver fails instead of publishing an empty scorecard
 - **Verified on the workspace after the refactor:** `ingest_tpch_region`, `clean_trips` and `build_trip_metrics` all succeeded with the same results as before (21,847 trips, 85 quarantined, 13/13 checks, same top zones)
 
-## 8. Table DDL as versioned migrations, separate from the jobs ⏳
+## 8. Table DDL as versioned migrations, separate from the jobs ✅
 
 **Goal:** tables are created and changed only by reviewed, versioned DDL, never by the jobs that write to them. The jobs load data into tables that already exist, and Delta rejects any write that doesn't match the declared schema.
 
@@ -377,7 +377,9 @@ Built and verified on the workspace:
   - all jobs succeeded under the new names, with 13/13 gold checks
 - **[`scripts/new_bronze_migration.py`](../scripts/new_bronze_migration.py)** reads a source's schema with `DESCRIBE TABLE` on the warehouse. Its output for `tpch_region` was identical to the committed baseline, and it refuses to overwrite an existing migration.
 - **46 tests** in total (up from 23)
-- **Silver trigger after the rename: not verified yet.** The `clean_trips` trigger now watches `00_bronze.nyctaxi_trips`. In the first test the ingest's write committed about 25 seconds after unpausing the trigger, and no run started within 9 minutes. The likely cause is that the trigger hadn't recorded the table's starting state yet. A retest that waits 2 minutes after unpausing is in progress.
+- **The silver trigger follows the rename.** `clean_trips` now watches `00_bronze.nyctaxi_trips`.
+  - With the trigger unpaused 2 minutes before the write, `ingest_nyctaxi_trips` finished at 23:29:22 UTC and `clean_trips` started by itself at 23:30:58 (`trigger: TABLE`). It succeeded with the contract check (241,252 bronze rows, 0 inserted), and the trigger was paused again.
+  - **Learned:** a table update trigger needs time after it's unpaused before it notices writes. In the first attempt the write committed about 25 seconds after unpausing, and nothing fired within 9 minutes. When testing triggers, unpause, wait a couple of minutes, then write.
 
 Note: **least privilege** can only be documented here, not demonstrated. Free Edition has a single user, so the jobs and the migration runner run as the same identity.
 
