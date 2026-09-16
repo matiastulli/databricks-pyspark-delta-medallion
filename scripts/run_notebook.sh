@@ -47,19 +47,24 @@ EOF
 )
 
 echo "-> running $NOTEBOOK on serverless (waits until the run finishes)"
-run=$(databricks jobs submit --timeout 30m -o json --json "$payload")
+# --no-wait returns the run ID straight away. Waiting inside `jobs submit` would exit with a generic
+# "Workload failed" on failure, before we could read the notebook's own error.
+run_id=$(databricks jobs submit --no-wait -o json --json "$payload" | python3 -c 'import json, sys; print(json.load(sys.stdin)["run_id"])')
 
-python3 - "$run" <<'EOF'
-import json, subprocess, sys
-run = json.loads(sys.argv[1])
+python3 - "$run_id" <<'EOF'
+import json, subprocess, sys, time
+
+def databricks(*args):
+    return json.loads(subprocess.run(["databricks", *args, "-o", "json"], check=True, capture_output=True, text=True).stdout)
+
+run_id = sys.argv[1]
+while (run := databricks("jobs", "get-run", run_id))["state"]["life_cycle_state"] not in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR"):
+    time.sleep(10)
+
 state = run["state"]
 print("   run page:", run.get("run_page_url"))
 print("   result:  ", state.get("result_state"), state.get("state_message", ""))
-task_run_id = str(run["tasks"][0]["run_id"])
-output = json.loads(subprocess.run(
-    ["databricks", "jobs", "get-run-output", task_run_id, "-o", "json"],
-    check=True, capture_output=True, text=True,
-).stdout)
+output = databricks("jobs", "get-run-output", str(run["tasks"][0]["run_id"]))
 if output.get("error"):
     print("   error:   ", output["error"])
 if output.get("notebook_output", {}).get("result"):

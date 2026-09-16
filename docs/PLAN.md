@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–3 done · next up: **step 4, Gold**
+**Status:** steps 0–4 done · next up: **step 5, Orchestration**
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -10,8 +10,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 1. Setup | ✅ Done | Databricks Free Edition workspace, CLI auth, Unity Catalog catalog and schemas |
 | 2. Bronze | ✅ Done | Raw trips appended into Delta, with ingestion metadata |
 | 3. Silver | ✅ Done | Cleaned, typed, deduplicated trips via an idempotent `MERGE` |
-| 4. Gold | ⏳ Next | Daily and per-zone aggregates, plus data quality checks that fail the run |
-| 5. Orchestration | 🔜 Planned | A Databricks Asset Bundle job running bronze → silver → gold |
+| 4. Gold | ✅ Done | Daily and per-zone aggregates, plus data quality checks that fail the run |
+| 5. Orchestration | ⏳ Next | A Databricks Asset Bundle job running bronze → silver → gold |
 | 6. Tests + CI | 🔜 Planned | Transformations as pure functions, pytest, GitHub Actions |
 
 ## Constraints that shape every step
@@ -104,22 +104,27 @@ Each schema name starts with its layer number, so the schemas sort in pipeline o
 - **Quarantine rejected rows** instead of dropping them. Nothing disappears silently, and the quarantine can be queried to see why each trip was rejected. It keeps bronze's raw types, because the rows failed before typing.
 - Trips over 3 hours (33) are kept. They're suspicious but not impossible, and gold can decide whether they matter.
 
-## 4. Gold ⏳
+## 4. Gold ✅
 
 **Goal:** tables that answer questions directly, plus a run that fails loudly when the data is wrong.
 
-Planned:
-- `notebooks/02_gold.py` with two tables in `medallion.02_gold`:
-  - `daily_trips`: trips, revenue (`sum(fare_amount)`) and average distance per `pickup_date`
-  - `busiest_pickup_zones`: trips and revenue per `pickup_zip`, ranked
-- Rebuilt in full on each run (overwrite), because aggregates this small don't need incremental logic
-- **Data quality checks** that raise and fail the run, for example:
-  - silver and gold aren't empty
-  - `trip_id` is unique and not null in silver
-  - no negative revenue
-  - total trips in `daily_trips` equal silver's row count
+- [`notebooks/02_gold.py`](../notebooks/02_gold.py) builds two tables from `medallion.01_silver.trips`:
+  - `medallion.02_gold.daily_trips`: trips, revenue, and average distance, fare and duration per `pickup_date`. That's 60 rows, one per day from 2016-01-01 to 2016-02-29.
+  - `medallion.02_gold.busiest_pickup_zones`: pickup ZIPs ranked by trips with `dense_rank`, plus revenue and average fare. That's 120 ZIPs; the top three are 10001 (1,227 trips), 10003 (1,180) and 10011 (1,128).
+- **13 data quality checks**, in three groups:
+  - silver's contract: not empty, `trip_id` not null and unique
+  - each gold table's shape: not empty, one row per key, no negative revenue, 5-digit ZIPs, ranking starts at 1
+  - **reconciliation**: trips and revenue in each gold table add up exactly to silver
+- `scripts/run_notebook.sh` now submits with `--no-wait` and polls the run, so a failed run prints the notebook's own error and exits non-zero
 
-## 5. Orchestration 🔜
+**Decisions:**
+- **Compute → check → write.** The checks run on the new aggregates before anything is written. On failure the notebook raises `DataQualityError` listing every failed check, and gold keeps its last good version. We tested this with a throwaway copy containing an impossible check: the run failed with `1 of 13 data quality checks failed, gold was not written`, and both tables stayed at the same Delta version.
+- **Full overwrite each run** instead of incremental logic. The aggregates are tiny, and a Delta overwrite is atomic, so readers never see a half-written table.
+- Trips over 3 hours stay in the averages. That's a simple, visible choice to revisit if the averages look off.
+
+**Note:** Databricks' serverless limitations list DataFrame caching (`.cache()` / `.persist()`) as unsupported, so the notebook doesn't cache and the checks recompute from silver. That's cheap at this size. We didn't try caching ourselves.
+
+## 5. Orchestration ⏳
 
 **Goal:** deploy and run the whole pipeline as one job, with no hand-run scripts.
 
