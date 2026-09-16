@@ -19,7 +19,9 @@ The data is the [NYC taxi trips](https://docs.databricks.com/aws/en/discover/dat
 ## Getting started
 
 ```sh
-databricks auth login --host https://<your-workspace>.cloud.databricks.com
+cp .env.example .env             # then set DATABRICKS_HOST to your workspace URL
+set -a; source .env; set +a
+databricks auth login --host "$DATABRICKS_HOST"
 scripts/setup_unity_catalog.sh   # creates the medallion catalog and its 00_bronze / 01_silver / 02_gold schemas
 ```
 

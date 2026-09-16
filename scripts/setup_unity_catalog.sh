@@ -10,12 +10,24 @@
 # in pipeline order. They start with a digit, so the SQL quotes them with backticks.
 #
 # Usage: scripts/setup_unity_catalog.sh   (after `databricks auth login`)
+# Settings come from .env when it exists (see .env.example); the defaults below apply otherwise.
 set -euo pipefail
 
-CATALOG="${CATALOG:-medallion}"
+ENV_FILE="$(dirname "$0")/../.env"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a; source "$ENV_FILE"; set +a
+fi
 
-# Free Edition ships a single "Serverless Starter Warehouse"; look it up instead of hardcoding its ID.
-WAREHOUSE_ID=$(databricks warehouses list -o json | python3 -c 'import json, sys; print(json.load(sys.stdin)[0]["id"])')
+CATALOG="${CATALOG:-medallion}"
+BRONZE_SCHEMA="${BRONZE_SCHEMA:-00_bronze}"
+SILVER_SCHEMA="${SILVER_SCHEMA:-01_silver}"
+GOLD_SCHEMA="${GOLD_SCHEMA:-02_gold}"
+
+# Free Edition ships a single "Serverless Starter Warehouse", so fall back to the first one listed.
+WAREHOUSE_ID="${DATABRICKS_WAREHOUSE_ID:-}"
+if [[ -z "$WAREHOUSE_ID" ]]; then
+  WAREHOUSE_ID=$(databricks warehouses list -o json | python3 -c 'import json, sys; print(json.load(sys.stdin)[0]["id"])')
+fi
 
 run_sql() {
   echo "-> $1"
@@ -24,8 +36,8 @@ run_sql() {
     | python3 -c 'import json, sys; s = json.load(sys.stdin)["status"]; print("   ", s["state"], s.get("error", {}).get("message", "")); sys.exit(s["state"] != "SUCCEEDED")'
 }
 
-# Single quotes keep bash from treating the backticks as command substitution.
-run_sql "CREATE CATALOG IF NOT EXISTS ${CATALOG} COMMENT 'Medallion lakehouse on NYC taxi trips (PySpark + Delta)'"
-run_sql "CREATE SCHEMA IF NOT EXISTS ${CATALOG}."'`00_bronze`'" COMMENT 'Raw trips as ingested, plus ingestion metadata'"
-run_sql "CREATE SCHEMA IF NOT EXISTS ${CATALOG}."'`01_silver`'" COMMENT 'Cleaned, typed, deduplicated trips'"
-run_sql "CREATE SCHEMA IF NOT EXISTS ${CATALOG}."'`02_gold`'" COMMENT 'Aggregates ready for analysis'"
+# Escaped backticks (\`) quote the SQL identifiers without bash treating them as command substitution.
+run_sql "CREATE CATALOG IF NOT EXISTS \`${CATALOG}\` COMMENT 'Medallion lakehouse on NYC taxi trips (PySpark + Delta)'"
+run_sql "CREATE SCHEMA IF NOT EXISTS \`${CATALOG}\`.\`${BRONZE_SCHEMA}\` COMMENT 'Raw trips as ingested, plus ingestion metadata'"
+run_sql "CREATE SCHEMA IF NOT EXISTS \`${CATALOG}\`.\`${SILVER_SCHEMA}\` COMMENT 'Cleaned, typed, deduplicated trips'"
+run_sql "CREATE SCHEMA IF NOT EXISTS \`${CATALOG}\`.\`${GOLD_SCHEMA}\` COMMENT 'Aggregates ready for analysis'"

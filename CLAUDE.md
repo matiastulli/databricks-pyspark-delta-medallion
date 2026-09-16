@@ -21,6 +21,7 @@ Learning path (tick them off in `README.md` as they land):
 
 - Databricks **Free Edition**: serverless compute only, with usage limits. If a step doesn't fit, adapt the step rather than suggest a paid plan.
 - Databricks CLI (Homebrew). Authenticate with `databricks auth login` (browser OAuth). **Never ask for or handle personal access tokens in chat.** The CLI uses the `DEFAULT` profile in `~/.databrickscfg`. Keep the workspace host out of committed files.
+- Workspace-specific settings (`DATABRICKS_HOST`, `DATABRICKS_CONFIG_PROFILE`, `DATABRICKS_WAREHOUSE_ID`) and the catalog/schema names live in `.env`, which is git-ignored. `.env.example` is the committed template. Add new variables to both files, and only when code uses them. Never put tokens in `.env`, because auth is OAuth.
 - Unity Catalog: catalog `medallion` with schemas `00_bronze`, `01_silver`, `02_gold`. The user chose these names so the schemas sort in pipeline order. Unquoted names like `medallion.00_bronze.trips` parse fine (checked on the warehouse), and the setup script quotes them with backticks anyway. Free Edition's metastore has no storage root, so `databricks catalogs create` fails. Create catalogs with SQL on the serverless warehouse, which uses Default Storage. The only warehouse is the "Serverless Starter Warehouse". Stop it after ad-hoc SQL to save quota.
 - Local: Python 3.11 and Java 17 (Homebrew `openjdk@17`). Versions are pinned in `requirements.txt` (PySpark 4.2.0 + delta-spark 4.4.0) and were verified together locally. The Databricks serverless runtime may differ, so align the pins once the workspace exists.
 
@@ -34,11 +35,13 @@ A local Delta-enabled session needs `configure_spark_with_delta_pip(builder)` pl
 Databricks commands:
 
 ```sh
-databricks auth login --host https://<workspace>.cloud.databricks.com   # browser OAuth, saves the DEFAULT profile
-databricks current-user me                                               # check the auth works
-scripts/setup_unity_catalog.sh                                           # idempotent: catalog + 00_bronze/01_silver/02_gold schemas
-databricks schemas list medallion
-databricks warehouses stop <warehouse-id> --no-wait                      # warehouse IDs come from `databricks warehouses list`
+cp .env.example .env                                         # once, then fill in DATABRICKS_HOST (never overwrite an existing .env)
+set -a; source .env; set +a                                  # load workspace settings into the shell
+databricks auth login --host "$DATABRICKS_HOST"              # browser OAuth, saves the DEFAULT profile
+databricks current-user me                                   # check the auth works
+scripts/setup_unity_catalog.sh                               # idempotent, reads .env: catalog + 00_bronze/01_silver/02_gold schemas
+databricks schemas list "$CATALOG"
+databricks warehouses stop "$DATABRICKS_WAREHOUSE_ID" --no-wait   # stop after ad-hoc SQL to save quota
 ```
 
 ## Working agreements
