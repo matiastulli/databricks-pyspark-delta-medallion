@@ -62,10 +62,14 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 
 Layout: notebooks are Databricks source files (`# Databricks notebook source`, `# COMMAND ----------` between cells). `src/` has **one folder per schema** (`00_bronze/`, `01_silver/`, `02_gold/`, as the user chose), holding the processes that write to that schema. Processes are **named after what they do** (`ingest.py`, `clean_trips.py`, `build_trip_metrics.py`), never after the schema. On serverless a notebook's working directory is its own folder, so each notebook starts with a cell doing `sys.path.insert(0, os.path.abspath(".."))` to import the shared `src/medallion/` package (verified with a bundle run). Notebooks read the catalog and schema names from widgets, which the job fills in through job parameters from the bundle variables.
 
-`src/medallion/` holds the pure, unit-tested logic:
+`src/medallion/` holds all the pure, unit-tested logic. Notebooks only read tables, call these functions, write tables and orchestrate:
 - `sources.py`: `load_sources`, `get_source`, `parse_sources`, which validates `config/sources.toml`
-- `silver.py`: `add_trip_id`, `keep_first_load`, `split_valid_and_rejected`
+- `bronze.py`: `add_ingestion_metadata`
+- `silver.py`: `add_trip_id`, `keep_first_load`, `split_valid_and_rejected` (rules include `missing_required_value`, because `null <= 0` is null and would pass as valid), `to_silver_trips`, `to_quarantine`
+- `gold.py`: `daily_trips`, `busiest_pickup_zones`
 - `quality.py`: `gold_checks`, `raise_if_any_failed`
+
+New logic goes into `src/medallion/` with tests. `DeltaTable` `MERGE`s and table writes stay in the notebooks, because the tests use plain local Spark without Delta.
 
 **One workflow per process** (the user's production practice):
 - Bronze is config-driven. `config/sources.toml` lists every source (`name`, `table`, `target`, `mode` = `append` | `overwrite`, `schedule` = Quartz cron in UTC).
@@ -80,7 +84,7 @@ Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no
 
 ## Working agreements
 
-- **Get CI/CD working early, and test only the high-risk logic until the end.** The user wants the delivery path (GitHub Actions, Asset Bundle deploy, a real run) working as early as possible, not built after every layer exists. Write tests as you go but keep them few. Cover the logic where a bug would silently corrupt data: the `trip_id` key, deduplication, the validation that splits silver from quarantine, and gold reconciliation / data quality checks. The complete test suite comes in the last step. (This came in after steps 0–4 were built, which is why orchestration and CI weren't set up earlier.)
+- **Get CI/CD working early, and test only the high-risk logic until the end.** (Done for this project: the full suite landed in step 7.) The user wants the delivery path (GitHub Actions, Asset Bundle deploy, a real run) working as early as possible, not built after every layer exists. Write tests as you go but keep them few. Cover the logic where a bug would silently corrupt data: the `trip_id` key, deduplication, the validation that splits silver from quarantine, and gold reconciliation / data quality checks. The complete test suite comes in the last step. (This came in after steps 0–4 were built, which is why orchestration and CI weren't set up earlier.)
 - **CI on GitHub, CD from the laptop.** GitHub Actions only runs tests. The user deploys with `databricks bundle deploy` / `run` locally. Don't add Databricks credentials, service principals or deploy steps to CI.
 - The repo is **public**. Confirm with the user before pushing, and keep secrets and workspace-specific IDs out of committed files.
 - The user's GitHub profile README (`~/Code/matiastulli`) lists this project. Update its entry as the project progresses, and pull before editing because the user also edits it on the web.

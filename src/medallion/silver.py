@@ -31,8 +31,13 @@ def keep_first_load(trips: DataFrame) -> DataFrame:
 
 
 def validation_rules() -> dict[str, Column]:
-    """Rule name -> condition that is true when a trip breaks the rule."""
+    """Rule name -> condition that is true when a trip breaks the rule.
+
+    The comparisons below are null when a value is missing (`null <= 0` is null, not true), so missing values need
+    their own rule; otherwise a trip with a null would pass as valid and break silver's NOT NULL columns.
+    """
     return {
+        "missing_required_value": F.greatest(*[F.col(c).isNull() for c in SOURCE_COLUMNS]),
         "non_positive_distance": F.col("trip_distance") <= 0,
         "non_positive_fare": F.col("fare_amount") <= 0,
         "dropoff_not_after_pickup": F.col("tpep_dropoff_datetime") <= F.col("tpep_pickup_datetime"),
@@ -48,3 +53,32 @@ def split_valid_and_rejected(trips: DataFrame) -> tuple[DataFrame, DataFrame]:
     reasons = F.array(*[F.when(condition, F.lit(name)) for name, condition in validation_rules().items()])
     flagged = trips.withColumn("rejection_reasons", F.filter(reasons, lambda reason: reason.isNotNull()))
     return flagged.where(F.size("rejection_reasons") == 0), flagged.where(F.size("rejection_reasons") > 0)
+
+
+def to_silver_trips(valid: DataFrame) -> DataFrame:
+    """Types and renames valid trips to the silver schema.
+
+    Fares become DECIMAL(10,2) because money shouldn't be a floating-point double, and ZIP codes become 5-character
+    strings because they are identifiers, not numbers (int 7002 is really 07002).
+    """
+    return valid.select(
+        "trip_id",
+        F.col("tpep_pickup_datetime").alias("pickup_at"),
+        F.col("tpep_dropoff_datetime").alias("dropoff_at"),
+        F.to_date("tpep_pickup_datetime").alias("pickup_date"),
+        F.round((F.unix_seconds("tpep_dropoff_datetime") - F.unix_seconds("tpep_pickup_datetime")) / 60, 2).alias("trip_duration_minutes"),
+        F.col("trip_distance").alias("trip_distance_miles"),
+        F.col("fare_amount").cast("decimal(10,2)").alias("fare_amount"),
+        F.lpad(F.col("pickup_zip").cast("string"), 5, "0").alias("pickup_zip"),
+        F.lpad(F.col("dropoff_zip").cast("string"), 5, "0").alias("dropoff_zip"),
+        "_batch_id",
+        "_ingested_at",
+        F.current_timestamp().alias("_merged_at"),
+    )
+
+
+def to_quarantine(rejected: DataFrame) -> DataFrame:
+    """Keeps rejected trips as received from bronze, plus the reasons they were rejected."""
+    return rejected.select(
+        "trip_id", "rejection_reasons", *SOURCE_COLUMNS, "_batch_id", "_ingested_at", F.current_timestamp().alias("_merged_at")
+    )

@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–6 done · next up: **step 7, complete the test suite**
+**Status:** ✅ all steps done
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -13,7 +13,7 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 4. Gold | ✅ Done | Daily and per-zone aggregates, plus data quality checks that fail the run |
 | 5. CI/CD + orchestration | ✅ Done | A thin but working delivery path: high-risk logic tested in GitHub Actions, and an Asset Bundle job running bronze → silver → gold |
 | 6. Scale out | ✅ Done | Generic ingestion driven by `config/sources.toml`, one scheduled job per source, and silver/gold jobs triggered by table updates |
-| 7. Complete tests | ⏳ Next | The rest of the transformations as pure functions, with full pytest coverage |
+| 7. Complete tests | ✅ Done | The rest of the transformations as pure functions, with full pytest coverage |
 
 ## Constraints that shape every step
 
@@ -212,14 +212,23 @@ Verified on Free Edition (both capabilities work):
 - **Folders mirror the schemas, and files name the process** (the user's call).
 - **Not built yet:** silver and gold for TPC-H, and generic silver helpers parameterized per entity. They come when a second entity actually needs silver.
 
-## 7. Complete the test suite ⏳
+## 7. Complete the test suite ✅
 
 **Goal:** fill in the tests that steps 5 and 6 deliberately skipped.
 
-Planned:
-- Move the remaining transformations into `src/medallion/` (bronze metadata columns, silver typing and renaming, gold aggregates) and test them
-- Edge cases for the step 5 functions: nulls in key columns, trips breaking several rules, empty inputs
-- Keep CI fast, so the tests keep running on every push
+Built:
+- **The rest of the logic moved into `src/medallion/`**, so notebooks only read, write and orchestrate:
+  - `bronze.py`: `add_ingestion_metadata`
+  - `silver.py`: `to_silver_trips` (typing and renaming) and `to_quarantine`
+  - `gold.py`: `daily_trips`, `busiest_pickup_zones`
+- **A real bug found by an edge-case test, written to fail first:** a trip with a missing value passed validation as *valid*. `null <= 0` is null, not true, so no rule flagged it, and silver's `NOT NULL` columns would have failed the `MERGE` on the first null. Fixed with a `missing_required_value` rule. Today's source has no nulls, so the published numbers didn't change.
+- **23 tests** (up from 14), about 7 seconds locally:
+  - bronze metadata: source columns untouched, the same batch metadata on every row
+  - silver edge cases: null key columns give a stable key that differs from real values, a missing value is rejected, empty input gives empty output
+  - silver typing: column names and order, zero-padded ZIPs, `DECIMAL` fares, duration, pickup date; quarantine keeps the bronze values as received
+  - gold aggregates: daily sums and averages, and tied zones share a `dense_rank` with no gap after
+  - quality: an empty silver fails instead of publishing an empty scorecard
+- **Verified on the workspace after the refactor:** `ingest_tpch_region`, `clean_trips` and `build_trip_metrics` all succeeded with the same results as before (21,847 trips, 85 quarantined, 13/13 checks, same top zones)
 
 ---
 

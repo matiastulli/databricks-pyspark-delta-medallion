@@ -51,17 +51,13 @@ import uuid
 
 from pyspark.sql import functions as F
 
+from medallion.bronze import add_ingestion_metadata
+
 batch_id = str(uuid.uuid4())
 
 raw = spark.table(source.table)
-
-bronze = raw.select(
-    "*",
-    F.lit(batch_id).alias("_batch_id"),
-    F.current_timestamp().alias("_ingested_at"),
-    F.lit(source.table).alias("_source_table"),
-    F.col("_metadata.file_path").alias("_source_file"),
-)
+# Metadata columns are added in src/medallion/bronze.py, where they are unit-tested.
+bronze = add_ingestion_metadata(raw, batch_id, source.table)
 
 # COMMAND ----------
 

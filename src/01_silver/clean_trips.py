@@ -8,8 +8,8 @@
 # MAGIC 1. **Key.** The source has no trip ID, so `trip_id` is a SHA-256 hash of the six source columns.
 # MAGIC    The same trip loaded in different bronze batches gets the same `trip_id`.
 # MAGIC 2. **Deduplicate.** Keep one row per `trip_id`, the first one loaded (earliest `_ingested_at`).
-# MAGIC 3. **Validate.** Flag trips that can't be real: a distance or fare of 0 or less, or a dropoff that
-# MAGIC    isn't after the pickup. Flagged trips go to **quarantine**, as received and with the rules they
+# MAGIC 3. **Validate.** Flag trips that can't be real: a missing value, a distance or fare of 0 or less, or a
+# MAGIC    dropoff that isn't after the pickup. Flagged trips go to **quarantine**, as received and with the rules they
 # MAGIC    broke, so they can be inspected instead of silently disappearing.
 # MAGIC 4. **Type and rename** the valid trips: clear column names, the fare as `DECIMAL(10,2)` (money
 # MAGIC    shouldn't be a floating-point double), ZIP codes as 5-character strings (int `7002` is really
@@ -89,35 +89,16 @@ COMMENT 'NYC taxi trips rejected by silver validation, as received from bronze, 
 
 from pyspark.sql import functions as F
 
-from medallion.silver import SOURCE_COLUMNS, add_trip_id, keep_first_load, split_valid_and_rejected
+from medallion.silver import add_trip_id, keep_first_load, split_valid_and_rejected, to_quarantine, to_silver_trips
 
 bronze = spark.table(bronze_table)
 
-# 1. Key, 2. deduplicate (first load wins), 3. validate into valid / rejected.
-# The logic lives in src/medallion/silver.py, where it is unit-tested.
+# Steps 1-4 live in src/medallion/silver.py, where they are unit-tested: key, deduplicate (first load wins),
+# validate into valid / rejected, then type the valid trips and keep the rejected ones as received.
 deduplicated = keep_first_load(add_trip_id(bronze))
 valid, rejected = split_valid_and_rejected(deduplicated)
-
-# 4. Type and rename the valid trips to match the silver table.
-silver = valid.select(
-    "trip_id",
-    F.col("tpep_pickup_datetime").alias("pickup_at"),
-    F.col("tpep_dropoff_datetime").alias("dropoff_at"),
-    F.to_date("tpep_pickup_datetime").alias("pickup_date"),
-    F.round((F.unix_seconds("tpep_dropoff_datetime") - F.unix_seconds("tpep_pickup_datetime")) / 60, 2).alias("trip_duration_minutes"),
-    F.col("trip_distance").alias("trip_distance_miles"),
-    F.col("fare_amount").cast("decimal(10,2)").alias("fare_amount"),
-    F.lpad(F.col("pickup_zip").cast("string"), 5, "0").alias("pickup_zip"),
-    F.lpad(F.col("dropoff_zip").cast("string"), 5, "0").alias("dropoff_zip"),
-    "_batch_id",
-    "_ingested_at",
-    F.current_timestamp().alias("_merged_at"),
-)
-
-# Rejected trips keep their bronze columns untouched.
-quarantine = rejected.select(
-    "trip_id", "rejection_reasons", *SOURCE_COLUMNS, "_batch_id", "_ingested_at", F.current_timestamp().alias("_merged_at")
-)
+silver = to_silver_trips(valid)
+quarantine = to_quarantine(rejected)
 
 # COMMAND ----------
 

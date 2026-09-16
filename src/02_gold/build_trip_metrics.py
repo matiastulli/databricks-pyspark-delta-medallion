@@ -39,34 +39,13 @@ busiest_pickup_zones_table = f"{gold_schema}.busiest_pickup_zones"
 
 # COMMAND ----------
 
-from pyspark.sql import Window
-from pyspark.sql import functions as F
+from medallion import gold
 
 silver = spark.table(silver_table)
 
-daily_trips = (
-    silver.groupBy("pickup_date")
-    .agg(
-        F.count("*").alias("trips"),
-        F.sum("fare_amount").alias("revenue"),
-        F.round(F.avg("trip_distance_miles"), 2).alias("avg_distance_miles"),
-        F.avg("fare_amount").cast("decimal(10,2)").alias("avg_fare"),
-        F.round(F.avg("trip_duration_minutes"), 2).alias("avg_duration_minutes"),
-    )
-    .orderBy("pickup_date")
-)
-
-zone_totals = silver.groupBy("pickup_zip").agg(
-    F.count("*").alias("trips"),
-    F.sum("fare_amount").alias("revenue"),
-    F.avg("fare_amount").cast("decimal(10,2)").alias("avg_fare"),
-)
-# dense_rank: ZIPs with the same number of trips share a rank.
-busiest_pickup_zones = (
-    zone_totals.withColumn("rank", F.dense_rank().over(Window.orderBy(F.desc("trips"))))
-    .select("rank", "pickup_zip", "trips", "revenue", "avg_fare")
-    .orderBy("rank", "pickup_zip")
-)
+# The aggregates live in src/medallion/gold.py, where they are unit-tested.
+daily_trips = gold.daily_trips(silver)
+busiest_pickup_zones = gold.busiest_pickup_zones(silver)
 
 # COMMAND ----------
 

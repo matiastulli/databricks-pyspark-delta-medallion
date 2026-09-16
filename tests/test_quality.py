@@ -52,3 +52,15 @@ def test_double_counted_trips_fail_reconciliation_and_stop_the_run(spark, silver
     ]
     with pytest.raises(DataQualityError, match="3 of 13 data quality checks failed"):
         raise_if_any_failed(results)
+
+
+def test_an_empty_silver_fails_instead_of_publishing_an_empty_scorecard(spark):
+    empty_silver = spark.createDataFrame([], SILVER_SCHEMA)
+    empty_daily = spark.createDataFrame([], DAILY_SCHEMA)
+    empty_zones = spark.createDataFrame([], ZONES_SCHEMA)
+
+    results = gold_checks(empty_silver, empty_daily, empty_zones)
+
+    assert {"silver is not empty", "daily_trips is not empty"} <= {r["check"] for r in results if not r["passed"]}
+    with pytest.raises(DataQualityError):
+        raise_if_any_failed(results)
