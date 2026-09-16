@@ -355,6 +355,30 @@ Confirmed by the user:
 - **Bronze DDL:** bronze tables are final tables, so they get migrations, generated per source by `scripts/new_bronze_migration.py <source>`. The script reads the source table's schema, adds the metadata columns, and writes the next numbered migration with the conventional name for review.
 - **The naming convention** above, including the gold `fct_` / `dim_` / `agg_` prefixes and the three renames.
 
+Built and verified on the workspace:
+- **Migrations and runner:**
+  - 17 migrations: the schemas (`create_schemas_v001`, plus `alter_schemas_v002` for the comments), 12 table baselines, and 3 renames
+  - [`src/medallion/migrations.py`](../src/medallion/migrations.py) holds the logic (18 tests)
+  - [`src/ops/apply_ddl.py`](../src/ops/apply_ddl.py) is the runner, deployed as the [`apply_ddl`](../resources/apply_ddl_job.yml) job with `dry_run`
+  - [`scripts/setup_unity_catalog.sh`](../scripts/setup_unity_catalog.sh) now creates only the catalog
+- **The baseline matches reality exactly.** All migrations applied to a fresh throwaway catalog produced the same 12 tables as `medallion`: 117 columns with identical order, types, `NOT NULL` and comments, plus identical table comments. The comparison also caught one mismatch: the schema comments in `create_schemas_v001` had been rewritten instead of copied. They were restored in v001 and changed properly in `alter_schemas_v002`.
+- **Drift detection works on Databricks.** Rerunning on the throwaway catalog after that edit failed with `create_schemas_v001.sql changed after it was applied`, and nothing ran.
+- **Adopted without rewriting data.** On `medallion`: dry run, then 14 migrations applied. Every table's Delta version and row count were unchanged, the schema comments were updated by v002, and a rerun applied nothing.
+- **Jobs stopped creating tables.**
+  - `ingest.py` and `build_trip_metrics.py` write with `writeTo(...).append()` / `.overwrite(F.lit(True))` instead of `saveAsTable` + `overwriteSchema`
+  - `clean_trips.py` lost its `CREATE TABLE` cells
+  - all three check that their tables exist, and table comments now live only in DDL
+  - After running all four job types, all 117 columns and 12 table comments were identical.
+- **Schema enforcement, tested on a `_tmp_` table:** Delta rejected an extra column, a null into `NOT NULL`, and an impossible cast. It **accepted a missing nullable column, filling it with null**. So [`src/medallion/contract.py`](../src/medallion/contract.py) (`raise_if_schema_mismatch`, 3 tests) now checks column names and types exactly before every write. Every gold column is nullable, so this is what stops an aggregation that loses a column from publishing nulls.
+- **Naming convention applied:**
+  - `config/sources.toml` lost `name` and `target`: bronze names come from `bronze_table_name` (`samples.nyctaxi.trips` → `nyctaxi_trips`), and the job became `ingest_nyctaxi_trips`
+  - three `rename_…_to_…_v001` migrations renamed `trips`, `daily_trips` and `busiest_pickup_zones`
+  - row counts, Delta history versions (16, 20, 20) and comments moved with the tables, and the old names are gone
+  - all jobs succeeded under the new names, with 13/13 gold checks
+- **[`scripts/new_bronze_migration.py`](../scripts/new_bronze_migration.py)** reads a source's schema with `DESCRIBE TABLE` on the warehouse. Its output for `tpch_region` was identical to the committed baseline, and it refuses to overwrite an existing migration.
+- **46 tests** in total (up from 23)
+- **Silver trigger after the rename: not verified yet.** The `clean_trips` trigger now watches `00_bronze.nyctaxi_trips`. In the first test the ingest's write committed about 25 seconds after unpausing the trigger, and no run started within 9 minutes. The likely cause is that the trigger hadn't recorded the table's starting state yet. A retest that waits 2 minutes after unpausing is in progress.
+
 Note: **least privilege** can only be documented here, not demonstrated. Free Edition has a single user, so the jobs and the migration runner run as the same identity.
 
 ---

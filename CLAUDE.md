@@ -41,13 +41,16 @@ cp .env.example .env                                         # once, then fill i
 set -a; source .env; set +a                                  # load workspace settings into the shell
 databricks auth login --host "$DATABRICKS_HOST"              # browser OAuth, saves the DEFAULT profile
 databricks current-user me                                   # check the auth works
-scripts/setup_unity_catalog.sh                               # idempotent, reads .env: catalog + 00_bronze/01_silver/02_gold schemas
+scripts/setup_unity_catalog.sh                               # idempotent, reads .env: the catalog only (CATALOG=x to target another)
 databricks schemas list "$CATALOG"
 databricks warehouses stop "$DATABRICKS_WAREHOUSE_ID" --no-wait   # stop after ad-hoc SQL to save quota
 databricks bundle validate                                   # also runs resources/__init__.py (needs .venv with databricks-bundles)
 databricks bundle validate -o json                           # inspect generated jobs, schedules, triggers and pause status
 databricks bundle deploy                                     # dev target: jobs "[dev <user>] <name>", every schedule and trigger PAUSED
-databricks bundle run ingest_trips                           # any ingest_<source>; prints the notebook's exit JSON
+databricks bundle run apply_ddl --params dry_run=true        # list pending DDL migrations without executing them
+databricks bundle run apply_ddl                              # apply pending migrations (run after deploy, before pipelines); reruns do nothing
+databricks bundle run ingest_nyctaxi_trips                   # any ingest_<source>; prints the notebook's exit JSON
+.venv/bin/python scripts/new_bronze_migration.py <name>      # generate src/00_bronze/ddl/create_bronze_<name>_v001.sql from the source schema (--dry-run prints)
 databricks bundle run clean_trips                            # must report rows_inserted: 0 on reruns
 databricks bundle run build_trip_metrics                     # fails with DataQualityError if a check fails
 databricks jobs list-runs --job-id <id> --limit 3            # the run's `trigger` field shows TABLE / PERIODIC / ONE_TIME
@@ -64,16 +67,18 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 Layout: notebooks are Databricks source files (`# Databricks notebook source`, `# COMMAND ----------` between cells). `src/` has **one folder per schema** (`00_bronze/`, `01_silver/`, `02_gold/`, as the user chose), holding the processes that write to that schema. Processes are **named after what they do** (`ingest.py`, `clean_trips.py`, `build_trip_metrics.py`), never after the schema. On serverless a notebook's working directory is its own folder, so each notebook starts with a cell doing `sys.path.insert(0, os.path.abspath(".."))` to import the shared `src/medallion/` package (verified with a bundle run). Notebooks read the catalog and schema names from widgets, which the job fills in through job parameters from the bundle variables.
 
 `src/medallion/` holds all the pure, unit-tested logic. Notebooks only read tables, call these functions, write tables and orchestrate:
-- `sources.py`: `load_sources`, `get_source`, `parse_sources`, which validates `config/sources.toml`
+- `sources.py`: `load_sources`, `get_source`, `parse_sources` (validates `config/sources.toml`), `bronze_table_name` (`samples.tpch.orders` → `tpch_orders`)
 - `bronze.py`: `add_ingestion_metadata`
 - `silver.py`: `add_trip_id`, `keep_first_load`, `split_valid_and_rejected` (rules include `missing_required_value`, because `null <= 0` is null and would pass as valid), `to_silver_trips`, `to_quarantine`
-- `gold.py`: `daily_trips`, `busiest_pickup_zones`
+- `gold.py`: `daily_trips`, `busiest_pickup_zones` (written to `agg_trips_daily`, `agg_trips_by_pickup_zip`)
 - `quality.py`: `gold_checks`, `raise_if_any_failed`
+- `contract.py`: `schema_mismatches`, `raise_if_schema_mismatch`. Every job calls it before writing, because Delta silently accepts a missing nullable column and castable types (verified)
+- `migrations.py`: parsing, run order, pending/drift detection, statement splitting, placeholders, bronze DDL generation
 
 New logic goes into `src/medallion/` with tests. `DeltaTable` `MERGE`s and table writes stay in the notebooks, because the tests use plain local Spark without Delta.
 
 **One workflow per process** (the user's production practice):
-- Bronze is config-driven. `config/sources.toml` lists every source (`name`, `table`, `target`, `mode` = `append` | `overwrite`, `schedule` = Quartz cron in UTC).
+- Bronze is config-driven. `config/sources.toml` lists every source (`table`, `mode` = `append` | `overwrite`, `schedule` = Quartz cron in UTC). The bronze table and job names are derived from `table` (`<source_system>_<source_table>`), never configured.
 - `resources/__init__.py` (Python-defined bundle resources, `databricks-bundles` pinned to the CLI version) generates one job `ingest_<name>` per entry. Each job runs `00_bronze/ingest.py` with job parameter `source` on its own schedule.
 - `clean_trips` (silver) and `build_trip_metrics` (gold scorecard) are YAML jobs with **table update triggers** on their input table.
 - Add a bronze table by adding a config entry. Never add a notebook or job YAML for it, and never put all sources in one job.
@@ -81,7 +86,17 @@ New logic goes into `src/medallion/` with tests. `DeltaTable` `MERGE`s and table
 - To test a trigger in dev, unpause it with `databricks jobs update` and pause it again afterwards, because development mode deploys it paused.
 - `samples.tpch.lineitem` (30M rows) is left out to protect Free Edition quota.
 
-Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no nulls. The columns are `tpep_pickup_datetime`, `tpep_dropoff_datetime`, `trip_distance`, `fare_amount`, `pickup_zip`, `dropoff_zip`. There is **no trip ID**, and zones are ZIP codes. Bronze (`medallion.00_bronze.trips`) is append-only, so every run adds a full batch under a new `_batch_id`. Silver (`medallion.01_silver.trips`) keys trips by `trip_id` = SHA-256 of the six source columns, with timestamps as `unix_micros` so the key doesn't depend on the time zone. Its `MERGE` is insert-only, because a matching key means identical content. Rejected trips go to `medallion.01_silver.trips_quarantine`, keeping their bronze columns and adding `rejection_reasons`. Every distinct trip lands in exactly one of the two tables, and the notebook asserts that. Gold (`medallion.02_gold.daily_trips`, `busiest_pickup_zones`) runs in the order compute → data quality checks → overwrite, so a failing check raises `DataQualityError` before any write. Don't use `.cache()`/`.persist()` in notebooks: Databricks documents DataFrame caching as unsupported on serverless (not tested here).
+Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no nulls. The columns are `tpep_pickup_datetime`, `tpep_dropoff_datetime`, `trip_distance`, `fare_amount`, `pickup_zip`, `dropoff_zip`. There is **no trip ID**, and zones are ZIP codes. Bronze (`medallion.00_bronze.nyctaxi_trips`) is append-only, so every run adds a full batch under a new `_batch_id`. Silver (`medallion.01_silver.trips`) keys trips by `trip_id` = SHA-256 of the six source columns, with timestamps as `unix_micros` so the key doesn't depend on the time zone. Its `MERGE` is insert-only, because a matching key means identical content. Rejected trips go to `medallion.01_silver.trips_quarantine`, keeping their bronze columns and adding `rejection_reasons`. Every distinct trip lands in exactly one of the two tables, and the notebook asserts that. Gold (`medallion.02_gold.agg_trips_daily`, `agg_trips_by_pickup_zip`) runs in the order compute → data quality checks → overwrite, so a failing check raises `DataQualityError` before any write. Don't use `.cache()`/`.persist()` in notebooks: Databricks documents DataFrame caching as unsupported on serverless (not tested here).
+
+**Tables are code (step 8).**
+- Jobs never create, comment on or redefine tables. They check that the table exists, run `raise_if_schema_mismatch`, then write with `writeTo(...).append()` / `.overwrite(F.lit(True))` or `MERGE`. Never use `saveAsTable`, `overwriteSchema` or `mergeSchema` in jobs.
+- Every published table has DDL in `src/<NN_layer>/ddl/`: `<create|alter|rename|drop>_<layer>_<table>_v<NNN>.sql`, versioned per table, with `${catalog}` / `${bronze_schema}` / `${silver_schema}` / `${gold_schema}` placeholders. Schemas are in `00_bronze/ddl/*_schemas_v<NNN>.sql`.
+- A rename starts the new table's history (`rename_<layer>_<old>_to_<new>_v001.sql`) and runs after the old table's migrations.
+- **Never edit an applied migration.** Add the next version instead. `apply_ddl` refuses any drift (checksum), a missing file, or a moved file.
+- History lives in `<catalog>.ops.schema_migrations` (migration, version, file, checksum, applied_at), created by the runner itself.
+- Intermediates (DataFrames, temp views, `_tmp_*` tables dropped within a run) never get DDL.
+- Naming convention: bronze `<source_system>_<source_table>`, silver plural `<entity>` + `<entity>_quarantine`, gold `fct_` / `dim_` / `agg_<subject>_<grain>`, and no layer in table names. The full convention, including columns, is in `docs/PLAN.md` step 8.
+- Verify DDL changes against a throwaway catalog first (`CATALOG=x scripts/setup_unity_catalog.sh`, `bundle run apply_ddl --params catalog=x`, compare `information_schema.columns`, then `DROP CATALOG x CASCADE`).
 
 ## Working agreements
 

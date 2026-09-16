@@ -6,15 +6,16 @@
 # MAGIC
 # MAGIC | table | one row per | columns |
 # MAGIC |---|---|---|
-# MAGIC | `daily_trips` | pickup date | trips, revenue, average distance, fare and duration |
-# MAGIC | `busiest_pickup_zones` | pickup ZIP code | rank by trips, trips, revenue, average fare |
+# MAGIC | `agg_trips_daily` | pickup date | trips, revenue, average distance, fare and duration |
+# MAGIC | `agg_trips_by_pickup_zip` | pickup ZIP code | rank by trips, trips, revenue, average fare |
 # MAGIC
 # MAGIC **Order matters: compute → check → write.** The data quality checks run on the new aggregates *before*
 # MAGIC anything is written. If any check fails, the notebook raises, the run fails, and the gold tables keep
 # MAGIC their last good version. All checks run before raising, so one failed run reports every problem.
 # MAGIC
 # MAGIC Gold is rebuilt in full every run (Delta overwrite). The aggregates are tiny, and a Delta overwrite is
-# MAGIC atomic: readers see either the old table or the new one, never a half-written one.
+# MAGIC atomic: readers see either the old table or the new one, never a half-written one. The tables themselves are
+# MAGIC created and changed only by DDL migrations in `src/02_gold/ddl/` (the `apply_ddl` job).
 
 # COMMAND ----------
 
@@ -34,8 +35,8 @@ dbutils.widgets.text("gold_schema", "02_gold")
 catalog = dbutils.widgets.get("catalog")
 silver_table = f"`{catalog}`.`{dbutils.widgets.get('silver_schema')}`.trips"
 gold_schema = f"`{catalog}`.`{dbutils.widgets.get('gold_schema')}`"
-daily_trips_table = f"{gold_schema}.daily_trips"
-busiest_pickup_zones_table = f"{gold_schema}.busiest_pickup_zones"
+daily_trips_table = f"{gold_schema}.agg_trips_daily"
+busiest_pickup_zones_table = f"{gold_schema}.agg_trips_by_pickup_zip"
 
 # COMMAND ----------
 
@@ -69,13 +70,24 @@ raise_if_any_failed(results)
 
 # COMMAND ----------
 
-# All checks passed: publish. overwriteSchema lets a changed aggregation replace the table's schema too.
-for table_name, frame, comment in [
-    (daily_trips_table, daily_trips, "NYC taxi trips per pickup date: trips, revenue and averages. Rebuilt from silver on every run"),
-    (busiest_pickup_zones_table, busiest_pickup_zones, "NYC taxi pickup ZIP codes ranked by trips. Rebuilt from silver on every run"),
-]:
-    frame.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(table_name)
-    spark.sql(f"COMMENT ON TABLE {table_name} IS '{comment}'")
+# Tables are created only by DDL migrations (the apply_ddl job), never here.
+for table in [daily_trips_table, busiest_pickup_zones_table]:
+    if not spark.catalog.tableExists(table):
+        raise RuntimeError(f"{table} doesn't exist: run `databricks bundle run apply_ddl` first")
+
+from pyspark.sql import functions as F
+
+from medallion.contract import raise_if_schema_mismatch
+
+# What gets written must match the DDL exactly (names and types): Delta alone would accept a missing nullable column
+# (every gold column is nullable) or a castable type. Checked for both tables before either is written.
+for table_name, frame in [(daily_trips_table, daily_trips), (busiest_pickup_zones_table, busiest_pickup_zones)]:
+    raise_if_schema_mismatch(frame.dtypes, spark.table(table_name).dtypes, table_name)
+
+# All checks passed: publish. writeTo matches columns by name and never changes the table's schema, so an aggregation
+# that no longer matches the DDL fails here instead of silently redefining the table; the fix is a new migration.
+for table_name, frame in [(daily_trips_table, daily_trips), (busiest_pickup_zones_table, busiest_pickup_zones)]:
+    frame.writeTo(table_name).overwrite(F.lit(True))  # replace every row in one atomic commit
 
 # COMMAND ----------
 
@@ -84,8 +96,8 @@ import json
 summary = {
     "silver_rows": silver.count(),
     "checks_passed": len(results),
-    "daily_trips": {"table": daily_trips_table.replace("`", ""), "rows": spark.table(daily_trips_table).count()},
-    "busiest_pickup_zones": {
+    "agg_trips_daily": {"table": daily_trips_table.replace("`", ""), "rows": spark.table(daily_trips_table).count()},
+    "agg_trips_by_pickup_zip": {
         "table": busiest_pickup_zones_table.replace("`", ""),
         "rows": spark.table(busiest_pickup_zones_table).count(),
         "top_3": [row.asDict() for row in spark.table(busiest_pickup_zones_table).orderBy("rank").limit(3).select("rank", "pickup_zip", "trips").collect()],

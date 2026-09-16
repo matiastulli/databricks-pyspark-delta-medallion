@@ -23,7 +23,7 @@ def load_resources(bundle: Bundle) -> Resources:
             Job.from_dict(
                 {
                     "name": f"ingest_{source.name}",
-                    "description": f"Bronze: {source.table} -> {source.target} ({source.mode}). Generated from config/sources.toml",
+                    "description": f"Bronze: {source.table} -> {source.name} ({source.mode}). Generated from config/sources.toml",
                     "tags": {"layer": "bronze", "source": source.name},
                     "schedule": {"quartz_cron_expression": source.schedule, "timezone_id": "UTC"},
                     "max_concurrent_runs": 1,

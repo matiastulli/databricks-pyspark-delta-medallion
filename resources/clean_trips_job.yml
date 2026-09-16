@@ -6,12 +6,12 @@ resources:
       tags:
         layer: silver
 
-      # Runs when its input changes, not on a clock: whenever ingest_trips writes to bronze trips.
+      # Runs when its input changes, not on a clock: whenever ingest_nyctaxi_trips writes to bronze nyctaxi_trips.
       # Paused in the dev target (development mode), so it only runs when started by hand there.
       trigger:
         table_update:
           table_names:
-            - ${var.catalog}.${var.bronze_schema}.trips
+            - ${var.catalog}.${var.bronze_schema}.nyctaxi_trips
           condition: ANY_UPDATED
           # Let a burst of writes settle before starting.
           wait_after_last_change_seconds: 60

@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.abspath(".."))
 # COMMAND ----------
 
 # All parameters come from the job: ingest_<name> sets `source` to its own entry.
-dbutils.widgets.text("source", "trips")
+dbutils.widgets.text("source", "nyctaxi_trips")
 dbutils.widgets.text("catalog", "medallion")
 dbutils.widgets.text("bronze_schema", "00_bronze")
 
@@ -41,7 +41,7 @@ from medallion.sources import get_source
 
 source = get_source(dbutils.widgets.get("source"))
 # Backticks: the schema name starts with a digit.
-target_table = f"`{dbutils.widgets.get('catalog')}`.`{dbutils.widgets.get('bronze_schema')}`.{source.target}"
+target_table = f"`{dbutils.widgets.get('catalog')}`.`{dbutils.widgets.get('bronze_schema')}`.{source.name}"
 print(f"{source.name}: {source.table} -> {target_table} ({source.mode})")
 
 # COMMAND ----------
@@ -61,10 +61,20 @@ bronze = add_ingestion_metadata(raw, batch_id, source.table)
 
 # COMMAND ----------
 
-# saveAsTable creates the managed Delta table on the first run; afterwards `mode` decides append vs replace.
-bronze.write.format("delta").mode(source.mode).saveAsTable(target_table)
+# Tables are created only by DDL migrations (the apply_ddl job), never here.
+for table in [target_table]:
+    if not spark.catalog.tableExists(table):
+        raise RuntimeError(f"{table} doesn't exist: run `databricks bundle run apply_ddl` first")
 
-spark.sql(f"COMMENT ON TABLE {target_table} IS 'Raw {source.table}, loaded in {source.mode} mode, one _batch_id per load'")
+from medallion.contract import raise_if_schema_mismatch
+
+# What gets written must match the DDL exactly (names and types): Delta alone would accept a missing nullable column
+# or a castable type. writeTo never changes the table's schema; a source that changed needs a new migration.
+raise_if_schema_mismatch(bronze.dtypes, spark.table(target_table).dtypes, target_table)
+if source.mode == "append":
+    bronze.writeTo(target_table).append()
+else:
+    bronze.writeTo(target_table).overwrite(F.lit(True))  # replace every row: a full snapshot, in one atomic commit
 
 # COMMAND ----------
 

@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Clean trips (silver): clean, typed, one row per trip
 # MAGIC
-# MAGIC Reads `<catalog>.<bronze_schema>.trips` and merges it into two tables in `<catalog>.<silver_schema>`:
+# MAGIC Reads `<catalog>.<bronze_schema>.nyctaxi_trips` and merges it into two tables in `<catalog>.<silver_schema>`:
 # MAGIC `trips` for the clean trips and `trips_quarantine` for the rejected ones.
 # MAGIC
 # MAGIC 1. **Key.** The source has no trip ID, so `trip_id` is a SHA-256 hash of the six source columns.
@@ -36,7 +36,7 @@ dbutils.widgets.text("bronze_schema", "00_bronze")
 dbutils.widgets.text("silver_schema", "01_silver")
 
 catalog = dbutils.widgets.get("catalog")
-bronze_table = f"`{catalog}`.`{dbutils.widgets.get('bronze_schema')}`.trips"
+bronze_table = f"`{catalog}`.`{dbutils.widgets.get('bronze_schema')}`.nyctaxi_trips"
 silver_schema = f"`{catalog}`.`{dbutils.widgets.get('silver_schema')}`"
 silver_table = f"{silver_schema}.trips"
 quarantine_table = f"{silver_schema}.trips_quarantine"
@@ -44,46 +44,15 @@ quarantine_table = f"{silver_schema}.trips_quarantine"
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC The silver schema is a contract for the layers downstream, so both tables are created with explicit
-# MAGIC types and comments instead of being inferred from the first write. The quarantine table keeps the
-# MAGIC bronze column names and types, because it holds rows that failed before any typing happened.
+# MAGIC Both tables are created and changed only by DDL migrations in `src/01_silver/ddl/` (the `apply_ddl` job). This
+# MAGIC notebook only merges rows into them, and Delta rejects any row that doesn't match their declared schema.
 
 # COMMAND ----------
 
-spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {silver_table} (
-  trip_id               STRING        NOT NULL COMMENT 'SHA-256 of the six source columns',
-  pickup_at             TIMESTAMP     NOT NULL,
-  dropoff_at            TIMESTAMP     NOT NULL,
-  pickup_date           DATE          NOT NULL,
-  trip_duration_minutes DOUBLE        NOT NULL,
-  trip_distance_miles   DOUBLE        NOT NULL,
-  fare_amount           DECIMAL(10,2) NOT NULL,
-  pickup_zip            STRING        NOT NULL COMMENT '5-character ZIP code, zero-padded',
-  dropoff_zip           STRING        NOT NULL COMMENT '5-character ZIP code, zero-padded',
-  _batch_id             STRING        NOT NULL COMMENT 'Bronze batch the trip was first loaded in',
-  _ingested_at          TIMESTAMP     NOT NULL COMMENT 'When that bronze batch was loaded',
-  _merged_at            TIMESTAMP     NOT NULL COMMENT 'When silver inserted the row'
-)
-COMMENT 'NYC taxi trips: deduplicated, cleaned and typed, one row per trip_id'
-""")
-
-spark.sql(f"""
-CREATE TABLE IF NOT EXISTS {quarantine_table} (
-  trip_id               STRING        NOT NULL COMMENT 'SHA-256 of the six source columns',
-  rejection_reasons     ARRAY<STRING> NOT NULL COMMENT 'Names of the validation rules the trip broke',
-  tpep_pickup_datetime  TIMESTAMP,
-  tpep_dropoff_datetime TIMESTAMP,
-  trip_distance         DOUBLE,
-  fare_amount           DOUBLE,
-  pickup_zip            INT,
-  dropoff_zip           INT,
-  _batch_id             STRING        NOT NULL COMMENT 'Bronze batch the trip was first loaded in',
-  _ingested_at          TIMESTAMP     NOT NULL COMMENT 'When that bronze batch was loaded',
-  _merged_at            TIMESTAMP     NOT NULL COMMENT 'When silver quarantined the row'
-)
-COMMENT 'NYC taxi trips rejected by silver validation, as received from bronze, one row per trip_id'
-""")
+# Tables are created only by DDL migrations (the apply_ddl job), never here.
+for table in [silver_table, quarantine_table]:
+    if not spark.catalog.tableExists(table):
+        raise RuntimeError(f"{table} doesn't exist: run `databricks bundle run apply_ddl` first")
 
 # COMMAND ----------
 
@@ -105,8 +74,12 @@ quarantine = to_quarantine(rejected)
 from delta.tables import DeltaTable
 
 # 5. Insert-only MERGE: a matched trip_id is the same trip with the same content, so there is no update clause.
+from medallion.contract import raise_if_schema_mismatch
+
 def insert_new_trips(table_name, trips):
     """Merges trips into table_name on trip_id, inserting only unseen trips. Returns the rows inserted."""
+    # What gets merged must match the DDL exactly (names and types), before anything is written.
+    raise_if_schema_mismatch(trips.dtypes, spark.table(table_name).dtypes, table_name)
     (
         DeltaTable.forName(spark, table_name)
         .alias("target")
