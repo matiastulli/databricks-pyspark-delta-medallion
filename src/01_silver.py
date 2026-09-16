@@ -78,42 +78,16 @@ COMMENT 'NYC taxi trips rejected by silver validation, as received from bronze, 
 
 # COMMAND ----------
 
-from pyspark.sql import Window
 from pyspark.sql import functions as F
 
+from medallion.silver import SOURCE_COLUMNS, add_trip_id, keep_first_load, split_valid_and_rejected
+
 bronze = spark.table(bronze_table)
-source_columns = ["tpep_pickup_datetime", "tpep_dropoff_datetime", "trip_distance", "fare_amount", "pickup_zip", "dropoff_zip"]
 
-# 1. Key. Timestamps go in as epoch microseconds rather than strings, because a timestamp's string form
-# depends on the session time zone and the key must not.
-def as_key_part(column_name):
-    column = F.col(column_name)
-    if column_name.startswith("tpep_"):
-        column = F.unix_micros(column)
-    return F.coalesce(column.cast("string"), F.lit("null"))
-
-keyed = bronze.withColumn("trip_id", F.sha2(F.concat_ws("|", *[as_key_part(c) for c in source_columns]), 256))
-
-# 2. Deduplicate: first load of each trip wins.
-first_load = Window.partitionBy("trip_id").orderBy("_ingested_at")
-deduplicated = (
-    keyed.withColumn("_load_order", F.row_number().over(first_load))
-    .where("_load_order = 1")
-    .drop("_load_order")
-)
-
-# 3. Validate: collect the names of the rules each trip breaks; an empty list means the trip is valid.
-rules = {
-    "non_positive_distance": F.col("trip_distance") <= 0,
-    "non_positive_fare": F.col("fare_amount") <= 0,
-    "dropoff_not_after_pickup": F.col("tpep_dropoff_datetime") <= F.col("tpep_pickup_datetime"),
-}
-validated = deduplicated.withColumn(
-    "rejection_reasons",
-    F.filter(F.array(*[F.when(condition, F.lit(name)) for name, condition in rules.items()]), lambda reason: reason.isNotNull()),
-)
-valid = validated.where(F.size("rejection_reasons") == 0)
-rejected = validated.where(F.size("rejection_reasons") > 0)
+# 1. Key, 2. deduplicate (first load wins), 3. validate into valid / rejected.
+# The logic lives in src/medallion/silver.py, where it is unit-tested.
+deduplicated = keep_first_load(add_trip_id(bronze))
+valid, rejected = split_valid_and_rejected(deduplicated)
 
 # 4. Type and rename the valid trips to match the silver table.
 silver = valid.select(
@@ -133,7 +107,7 @@ silver = valid.select(
 
 # Rejected trips keep their bronze columns untouched.
 quarantine = rejected.select(
-    "trip_id", "rejection_reasons", *source_columns, "_batch_id", "_ingested_at", F.current_timestamp().alias("_merged_at")
+    "trip_id", "rejection_reasons", *SOURCE_COLUMNS, "_batch_id", "_ingested_at", F.current_timestamp().alias("_merged_at")
 )
 
 # COMMAND ----------

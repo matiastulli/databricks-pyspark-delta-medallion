@@ -1,0 +1,32 @@
+# Databricks Asset Bundle: deploys the medallion pipeline as one job.
+#
+#   databricks bundle validate
+#   databricks bundle deploy          # dev is the default target
+#   databricks bundle run medallion   # waits for the run and fails if any task fails
+#
+# The workspace host is deliberately not set here (this repo is public): the CLI takes it from the
+# DEFAULT profile in ~/.databrickscfg, or from DATABRICKS_HOST.
+bundle:
+  name: databricks-pyspark-delta-medallion
+
+include:
+  - resources/*.yml
+
+# Override any of these per run with --var, e.g. --var catalog=my_catalog, or with BUNDLE_VAR_catalog.
+variables:
+  catalog:
+    description: Unity Catalog catalog that holds the three layers
+    default: medallion
+  bronze_schema:
+    default: 00_bronze
+  silver_schema:
+    default: 01_silver
+  gold_schema:
+    default: 02_gold
+
+targets:
+  dev:
+    # Development mode: deploys under your user folder, prefixes the job name with "[dev <user>]",
+    # and pauses any schedules, so nothing runs (or spends Free Edition quota) on its own.
+    mode: development
+    default: true

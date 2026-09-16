@@ -65,13 +65,13 @@ Each schema name starts with its layer number, so the schemas sort in pipeline o
 
 **Goal:** land the source data in our own Delta table, untouched, and trace where every row came from.
 
-- [`notebooks/00_bronze.py`](../notebooks/00_bronze.py) reads `samples.nyctaxi.trips` and appends to `medallion.00_bronze.trips`, adding:
+- [`src/00_bronze.py`](../src/00_bronze.py) (in `notebooks/` until step 5) reads `samples.nyctaxi.trips` and appends to `medallion.00_bronze.trips`, adding:
   - `_batch_id`: one UUID per run
   - `_ingested_at`: when the run wrote the row
   - `_source_table`: where the data came from
   - `_source_file`: the source data file, from Spark's hidden `_metadata` column
 - The notebook fails if a batch doesn't contain exactly the source row count, and it returns a JSON summary as the run output
-- [`scripts/run_notebook.sh`](../scripts/run_notebook.sh) uploads a notebook and runs it once on serverless with `databricks jobs submit`, passing the catalog and schema names from `.env`
+- `scripts/run_notebook.sh` (replaced by the Asset Bundle in step 5) uploaded a notebook and runs it once on serverless with `databricks jobs submit`, passing the catalog and schema names from `.env`.
 
 **Decisions:**
 - **Append-only.** Rerunning adds the same trips again under a new `_batch_id`. Bronze keeps the full load history, and deduplication belongs to silver. Two runs are loaded so far (43,864 rows, 2 batches), which gives step 3 real duplicates to handle.
@@ -81,7 +81,7 @@ Each schema name starts with its layer number, so the schemas sort in pipeline o
 
 **Goal:** one clean, correctly typed row per trip, and reruns that change nothing.
 
-- [`notebooks/01_silver.py`](../notebooks/01_silver.py) reads all of bronze and merges into `medallion.01_silver.trips` (valid trips) and `medallion.01_silver.trips_quarantine` (rejected trips)
+- [`src/01_silver.py`](../src/01_silver.py) (in `notebooks/` until step 5) reads all of bronze and merges into `medallion.01_silver.trips` (valid trips) and `medallion.01_silver.trips_quarantine` (rejected trips)
 - Both tables are created up front with explicit types, `NOT NULL` and column comments, because silver's schema is a contract for gold
 - **Key:** `trip_id` = SHA-256 of the six source columns. Timestamps go in as `unix_micros`, because their string form depends on the session time zone.
 - **Deduplicate** on `trip_id`, keeping the first load (earliest `_ingested_at`). 43,864 bronze rows became exactly the source's 21,932 trips.
@@ -108,14 +108,14 @@ Each schema name starts with its layer number, so the schemas sort in pipeline o
 
 **Goal:** tables that answer questions directly, plus a run that fails loudly when the data is wrong.
 
-- [`notebooks/02_gold.py`](../notebooks/02_gold.py) builds two tables from `medallion.01_silver.trips`:
+- [`src/02_gold.py`](../src/02_gold.py) (in `notebooks/` until step 5) builds two tables from `medallion.01_silver.trips`:
   - `medallion.02_gold.daily_trips`: trips, revenue, and average distance, fare and duration per `pickup_date`. That's 60 rows, one per day from 2016-01-01 to 2016-02-29.
   - `medallion.02_gold.busiest_pickup_zones`: pickup ZIPs ranked by trips with `dense_rank`, plus revenue and average fare. That's 120 ZIPs; the top three are 10001 (1,227 trips), 10003 (1,180) and 10011 (1,128).
 - **13 data quality checks**, in three groups:
   - silver's contract: not empty, `trip_id` not null and unique
   - each gold table's shape: not empty, one row per key, no negative revenue, 5-digit ZIPs, ranking starts at 1
   - **reconciliation**: trips and revenue in each gold table add up exactly to silver
-- `scripts/run_notebook.sh` now submits with `--no-wait` and polls the run, so a failed run prints the notebook's own error and exits non-zero
+- `scripts/run_notebook.sh` was changed to submit with `--no-wait` and poll the run, so a failed run printed the notebook's own error and exited non-zero
 
 **Decisions:**
 - **Compute → check → write.** The checks run on the new aggregates before anything is written. On failure the notebook raises `DataQualityError` listing every failed check, and gold keeps its last good version. We tested this with a throwaway copy containing an impossible check: the run failed with `1 of 13 data quality checks failed, gold was not written`, and both tables stayed at the same Delta version.
@@ -130,31 +130,43 @@ Each schema name starts with its layer number, so the schemas sort in pipeline o
 
 > This step used to come after all the layers, with every test written at the end. The order changed after step 4, following the working preference to **get CI/CD running early and test only the high-risk logic until the final step**.
 
-Planned:
-- **Pull only the high-risk logic out into pure functions in `src/`**, each taking and returning a DataFrame or plain values. The notebooks import these functions and keep the reading, writing and orchestration.
-  - `trip_id` key: stable across batches and time zones
-  - deduplication: the first load wins
-  - validation: every trip ends up in exactly one of silver or quarantine, with the right reasons
-  - gold data quality checks: reconciliation catches lost or double-counted trips
-- **A few pytest tests** for exactly those, on local PySpark (the step 0 environment) with small hand-written DataFrames. No coverage for its own sake.
-- **GitHub Actions CI:** Python 3.11 + Java 17, install `requirements.txt`, run pytest on every push and pull request
-- **`databricks.yml` Asset Bundle:**
-  - one job with three serverless notebook tasks, bronze → silver → gold
-  - bundle variables for the catalog and schema names
-  - a `dev` target
-  - deploy and run it once for real with `databricks bundle deploy` / `databricks bundle run`
-  - it replaces `scripts/run_notebook.sh`
-  - no schedule, or a paused one, to protect Free Edition quota
+Built, in the order that got the path working soonest:
 
-Open questions:
-- **CD from GitHub Actions, or deploy from the laptop?** Deploying from CI needs a Databricks service principal with OAuth credentials stored as GitHub Actions secrets. They'd be created in the Databricks and GitHub UIs, never pasted into chat or committed. First check that Free Edition allows it. If it doesn't, CI runs tests plus `databricks bundle validate`, and deploys happen from the laptop.
+1. **Asset Bundle first, with the notebooks unchanged**
+   - [`databricks.yml`](../databricks.yml): bundle variables for the catalog and schemas, and a `dev` target in development mode. The job name gets a `[dev <user>]` prefix and schedules are paused.
+   - [`resources/medallion_job.yml`](../resources/medallion_job.yml): one job with three serverless notebook tasks, bronze → silver → gold. Job parameters reach every task as notebook widgets.
+   - No workspace host in the file (the repo is public): the CLI takes it from the `DEFAULT` profile
+   - `databricks bundle deploy` + `databricks bundle run medallion` ran end to end in about 1 minute, and silver still inserted 0 rows on rerun
+2. **High-risk logic moved into [`src/medallion/`](../src/medallion)**
+   - `silver.py`: `add_trip_id`, `keep_first_load`, `split_valid_and_rejected`
+   - `quality.py`: `gold_checks`, `raise_if_any_failed`
+   - The notebooks import them. Typing, renaming, gold aggregates and table I/O stay in the notebooks until step 6.
+3. **6 pytest tests** ([`tests/`](../tests)), which take about 6 seconds on local PySpark with no Delta
+   - the same trip gets the same `trip_id` across batches, and a different trip gets a different one
+   - `trip_id` doesn't change with the session time zone
+   - the first load wins
+   - every trip lands in exactly one of valid or rejected, with all the rules it broke
+   - gold that matches silver passes every check
+   - double-counted trips fail reconciliation and raise
+   - **Checked that the tests catch real bugs:** hashing timestamps as strings, or keeping the latest load instead of the first, each made its own test fail
+4. **Notebooks moved into `src/`**, next to the package they import. That's the layout of Databricks' default bundle template. On serverless a notebook's own folder is on `sys.path`, so the import needs no path fix (verified with a bundle run).
+5. **GitHub Actions CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)): Python 3.11, Java 17, `pip install -r requirements.txt`, then `pytest` on pushes to `main` and on pull requests
+6. `scripts/run_notebook.sh` removed, because the bundle replaces it
+
+Remaining:
+- See CI pass on GitHub after the first push
+- **Decide on CD:** deploy from GitHub Actions, or from the laptop? Deploying from CI needs a Databricks service principal with OAuth credentials stored as GitHub Actions secrets. They'd be created in the Databricks and GitHub UIs, never pasted into chat or committed. First check that Free Edition allows it. If it doesn't, deploys stay on the laptop.
+
+**Decisions:**
+- **The package stays `medallion`, not `tests`.** It's production logic that the job runs. `tests/` holds the pytest tests that check it.
+- **Bronze appends a full batch on every job run.** That's by design: silver deduplicates. Five batches are loaded so far.
 
 ## 6. Complete the test suite 🔜
 
 **Goal:** fill in the tests that step 5 deliberately skipped.
 
 Planned:
-- Move the remaining transformations into `src/` (bronze metadata columns, silver typing and renaming, gold aggregates) and test them
+- Move the remaining transformations into `src/medallion/` (bronze metadata columns, silver typing and renaming, gold aggregates) and test them
 - Edge cases for the step 5 functions: nulls in key columns, trips breaking several rules, empty inputs
 - Keep CI fast, so the tests keep running on every push
 

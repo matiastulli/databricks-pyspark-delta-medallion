@@ -2,3 +2,4 @@
 # Matches Databricks serverless compute (Spark 4.2.0, Python 3.11), checked in step 2.
 pyspark==4.2.0
 delta-spark==4.4.0
+pytest==9.1.1
