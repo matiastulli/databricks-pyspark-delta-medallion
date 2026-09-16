@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–4 done · next up: **step 5, CI/CD + orchestration**
+**Status:** steps 0–5 done · next up: **step 6, complete the test suite**
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -11,8 +11,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 2. Bronze | ✅ Done | Raw trips appended into Delta, with ingestion metadata |
 | 3. Silver | ✅ Done | Cleaned, typed, deduplicated trips via an idempotent `MERGE` |
 | 4. Gold | ✅ Done | Daily and per-zone aggregates, plus data quality checks that fail the run |
-| 5. CI/CD + orchestration | ⏳ Next | A thin but working delivery path: high-risk logic tested in GitHub Actions, and an Asset Bundle job running bronze → silver → gold |
-| 6. Complete tests | 🔜 Planned | The rest of the transformations as pure functions, with full pytest coverage |
+| 5. CI/CD + orchestration | ✅ Done | A thin but working delivery path: high-risk logic tested in GitHub Actions, and an Asset Bundle job running bronze → silver → gold |
+| 6. Complete tests | ⏳ Next | The rest of the transformations as pure functions, with full pytest coverage |
 
 ## Constraints that shape every step
 
@@ -124,7 +124,7 @@ Each schema name starts with its layer number, so the schemas sort in pipeline o
 
 **Note:** Databricks' serverless limitations list DataFrame caching (`.cache()` / `.persist()`) as unsupported, so the notebook doesn't cache and the checks recompute from silver. That's cheap at this size. We didn't try caching ourselves.
 
-## 5. CI/CD + orchestration, thin and early ⏳
+## 5. CI/CD + orchestration, thin and early ✅
 
 **Goal:** get the whole delivery path working now, not at the end. Every push is tested in CI, the pipeline deploys as a job, and one real run goes bronze → silver → gold. Later changes then land on a path that already works.
 
@@ -150,18 +150,15 @@ Built, in the order that got the path working soonest:
    - double-counted trips fail reconciliation and raise
    - **Checked that the tests catch real bugs:** hashing timestamps as strings, or keeping the latest load instead of the first, each made its own test fail
 4. **Notebooks moved into `src/`**, next to the package they import. That's the layout of Databricks' default bundle template. On serverless a notebook's own folder is on `sys.path`, so the import needs no path fix (verified with a bundle run).
-5. **GitHub Actions CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)): Python 3.11, Java 17, `pip install -r requirements.txt`, then `pytest` on pushes to `main` and on pull requests
+5. **GitHub Actions CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)): Python 3.11, Java 17, `pip install -r requirements.txt`, then `pytest` on pushes to `main` and on pull requests. It passed on its first run.
 6. `scripts/run_notebook.sh` removed, because the bundle replaces it
 
-Remaining:
-- See CI pass on GitHub after the first push
-- **Decide on CD:** deploy from GitHub Actions, or from the laptop? Deploying from CI needs a Databricks service principal with OAuth credentials stored as GitHub Actions secrets. They'd be created in the Databricks and GitHub UIs, never pasted into chat or committed. First check that Free Edition allows it. If it doesn't, deploys stay on the laptop.
-
 **Decisions:**
+- **CI on GitHub, CD from the laptop.** GitHub Actions runs the tests, and deploys stay manual with `databricks bundle deploy` / `databricks bundle run` from the laptop. So GitHub holds no Databricks credentials and needs no service principal. The first CI run on GitHub passed (6 tests).
 - **The package stays `medallion`, not `tests`.** It's production logic that the job runs. `tests/` holds the pytest tests that check it.
 - **Bronze appends a full batch on every job run.** That's by design: silver deduplicates. Five batches are loaded so far.
 
-## 6. Complete the test suite 🔜
+## 6. Complete the test suite ⏳
 
 **Goal:** fill in the tests that step 5 deliberately skipped.
 

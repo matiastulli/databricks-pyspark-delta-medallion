@@ -62,6 +62,7 @@ Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no
 ## Working agreements
 
 - **Get CI/CD working early, and test only the high-risk logic until the end.** The user wants the delivery path (GitHub Actions, Asset Bundle deploy, a real run) working as early as possible, not built after every layer exists. Write tests as you go but keep them few. Cover the logic where a bug would silently corrupt data: the `trip_id` key, deduplication, the validation that splits silver from quarantine, and gold reconciliation / data quality checks. The complete test suite comes in the last step. (This came in after steps 0–4 were built, which is why orchestration and CI weren't set up earlier.)
+- **CI on GitHub, CD from the laptop.** GitHub Actions only runs tests. The user deploys with `databricks bundle deploy` / `run` locally. Don't add Databricks credentials, service principals or deploy steps to CI.
 - The repo is **public**. Confirm with the user before pushing, and keep secrets and workspace-specific IDs out of committed files.
 - The user's GitHub profile README (`~/Code/matiastulli`) lists this project. Update its entry as the project progresses, and pull before editing because the user also edits it on the web.
 - Add commands to this file as each step introduces them. Don't document commands that don't exist yet.
