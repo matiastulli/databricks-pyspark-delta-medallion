@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–4 done · next up: **step 5, Orchestration**
+**Status:** steps 0–4 done · next up: **step 5, CI/CD + orchestration**
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -11,8 +11,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 2. Bronze | ✅ Done | Raw trips appended into Delta, with ingestion metadata |
 | 3. Silver | ✅ Done | Cleaned, typed, deduplicated trips via an idempotent `MERGE` |
 | 4. Gold | ✅ Done | Daily and per-zone aggregates, plus data quality checks that fail the run |
-| 5. Orchestration | ⏳ Next | A Databricks Asset Bundle job running bronze → silver → gold |
-| 6. Tests + CI | 🔜 Planned | Transformations as pure functions, pytest, GitHub Actions |
+| 5. CI/CD + orchestration | ⏳ Next | A thin but working delivery path: high-risk logic tested in GitHub Actions, and an Asset Bundle job running bronze → silver → gold |
+| 6. Complete tests | 🔜 Planned | The rest of the transformations as pure functions, with full pytest coverage |
 
 ## Constraints that shape every step
 
@@ -124,25 +124,39 @@ Each schema name starts with its layer number, so the schemas sort in pipeline o
 
 **Note:** Databricks' serverless limitations list DataFrame caching (`.cache()` / `.persist()`) as unsupported, so the notebook doesn't cache and the checks recompute from silver. That's cheap at this size. We didn't try caching ourselves.
 
-## 5. Orchestration ⏳
+## 5. CI/CD + orchestration, thin and early ⏳
 
-**Goal:** deploy and run the whole pipeline as one job, with no hand-run scripts.
+**Goal:** get the whole delivery path working now, not at the end. Every push is tested in CI, the pipeline deploys as a job, and one real run goes bronze → silver → gold. Later changes then land on a path that already works.
 
-Planned:
-- `databricks.yml` Asset Bundle with a job of three notebook tasks, bronze → silver → gold, each depending on the previous one
-- Serverless compute, and bundle variables for the catalog and schema names (replacing the `.env` → widget handoff for deployed runs)
-- A `dev` target, deployed with `databricks bundle deploy` and run with `databricks bundle run`
-- Replaces `scripts/run_notebook.sh`
-- Keep the job schedule paused or leave it out, to protect Free Edition quota
-
-## 6. Tests + CI 🔜
-
-**Goal:** the transformation logic is tested without a workspace.
+> This step used to come after all the layers, with every test written at the end. The order changed after step 4, following the working preference to **get CI/CD running early and test only the high-risk logic until the final step**.
 
 Planned:
-- Move transformations (bronze metadata, silver key/cleaning/dedup, gold aggregates) into pure functions in `src/`, each taking and returning a DataFrame. The notebooks keep only the reading, writing and orchestration.
-- pytest on local PySpark + Delta (the step 0 environment) with small hand-written DataFrames
-- GitHub Actions: Python 3.11 + Java 17, install `requirements.txt`, run pytest. CI never talks to the workspace, so it needs no secrets.
+- **Pull only the high-risk logic out into pure functions in `src/`**, each taking and returning a DataFrame or plain values. The notebooks import these functions and keep the reading, writing and orchestration.
+  - `trip_id` key: stable across batches and time zones
+  - deduplication: the first load wins
+  - validation: every trip ends up in exactly one of silver or quarantine, with the right reasons
+  - gold data quality checks: reconciliation catches lost or double-counted trips
+- **A few pytest tests** for exactly those, on local PySpark (the step 0 environment) with small hand-written DataFrames. No coverage for its own sake.
+- **GitHub Actions CI:** Python 3.11 + Java 17, install `requirements.txt`, run pytest on every push and pull request
+- **`databricks.yml` Asset Bundle:**
+  - one job with three serverless notebook tasks, bronze → silver → gold
+  - bundle variables for the catalog and schema names
+  - a `dev` target
+  - deploy and run it once for real with `databricks bundle deploy` / `databricks bundle run`
+  - it replaces `scripts/run_notebook.sh`
+  - no schedule, or a paused one, to protect Free Edition quota
+
+Open questions:
+- **CD from GitHub Actions, or deploy from the laptop?** Deploying from CI needs a Databricks service principal with OAuth credentials stored as GitHub Actions secrets. They'd be created in the Databricks and GitHub UIs, never pasted into chat or committed. First check that Free Edition allows it. If it doesn't, CI runs tests plus `databricks bundle validate`, and deploys happen from the laptop.
+
+## 6. Complete the test suite 🔜
+
+**Goal:** fill in the tests that step 5 deliberately skipped.
+
+Planned:
+- Move the remaining transformations into `src/` (bronze metadata columns, silver typing and renaming, gold aggregates) and test them
+- Edge cases for the step 5 functions: nulls in key columns, trips breaking several rules, empty inputs
+- Keep CI fast, so the tests keep running on every push
 
 ---
 
