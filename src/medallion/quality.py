@@ -58,6 +58,6 @@ def raise_if_any_failed(results: list[dict]) -> None:
     failed = [result for result in results if not result["passed"]]
     if failed:
         raise DataQualityError(
-            f"{len(failed)} of {len(results)} data quality checks failed, gold was not written: "
+            f"{len(failed)} of {len(results)} data quality checks failed: "
             + "; ".join(f"{r['check']} (got {r['actual']}, expected {r['expected']})" for r in failed)
         )

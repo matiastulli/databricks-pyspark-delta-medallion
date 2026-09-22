@@ -46,8 +46,8 @@ flowchart LR
 |---|---|---|---|
 | Bronze | `src/00_bronze/` | `medallion.00_bronze` | Sources copied as is, plus `_batch_id`, `_ingested_at`, `_source_table`, `_source_file`. Tables are copied in full; files in the `landing` volume are picked up incrementally by Auto Loader |
 | Silver | `src/01_silver/` | `medallion.01_silver` | `trips`: deduplicated, validated, typed; `trips_quarantine`: rejected trips with their reasons |
-| Gold | `src/02_gold/` | `medallion.02_gold` | `agg_trips_daily`, `agg_trips_by_pickup_zip`: the trip scorecard |
-| Ops | `src/ops/` | `medallion.ops` | `apply_ddl` applies DDL migrations and records them in `schema_migrations`; `maintain_tables` runs the weekly `OPTIMIZE` / `VACUUM` |
+| Gold | `src/02_gold/` | `medallion.02_gold` | `agg_trips_daily` (built incrementally from silver's change feed), `agg_trips_by_pickup_zip` (a ranking, rebuilt in full) |
+| Ops | `src/ops/` | `medallion.ops` | `apply_ddl` applies DDL migrations and records them in `schema_migrations`; `maintain_tables` runs the weekly `OPTIMIZE` / `VACUUM`; `processed_versions` holds the incremental watermarks |
 
 ## What this project shows
 
@@ -59,7 +59,9 @@ flowchart LR
 - **Explicit types:** silver tables declare `NOT NULL` columns and comments in their DDL. Fares become `DECIMAL(10,2)` and ZIPs 5-character strings (`7002` → `07002`).
 
 **Data quality**
-- **Compute → check → write:** gold runs 13 checks on the new aggregates before publishing: silver's contract, one row per key, and **reconciliation** of trips and revenue with silver. Any failure raises `DataQualityError` listing every failed check, and gold keeps its last good version.
+- **Compute → check → write** for a full rebuild: the 13 checks run before anything is published (silver's contract, one row per key, and **reconciliation** of trips and revenue with silver).
+- **Write → check → roll back** for an incremental merge, because the result only exists once merged: the job notes gold's version, merges, checks, and on failure runs `RESTORE TABLE … TO VERSION AS OF`. Either way a bad aggregate never stays published, and the watermark only moves after the checks pass.
+- Proven by breaking it on purpose: a gold date deleted by hand made reconciliation fail (`got 21475, expected 21833`), the run failed, and gold came back at its pre-run values.
 
 **Tables as code: DDL migrations**
 - **Jobs never create tables.** Every published table is defined by write-once SQL in its schema's folder, e.g. `src/01_silver/ddl/silver_trips_v001_create.sql`, then `silver_trips_v002_alter.sql`. Versions are counted per table, and the `apply_ddl` workflow applies the pending ones and records them in `ops.schema_migrations`.
@@ -73,6 +75,13 @@ flowchart LR
 - **Optimized writes and auto compaction** on the tables written every run, with each migration explaining that one acts before the write and the other after the commit.
 - **A weekly [`maintain_tables`](resources/maintain_tables_job.yml) workflow:** `OPTIMIZE` (the only operation that re-clusters), optional `REORG TABLE … APPLY (PURGE)` to materialize deletion vectors, and `VACUUM` in dry run by default, since it shortens time travel. It reports files, size and clustering before and after.
 - **What Databricks already does here:** these are Unity Catalog managed tables, so deletion vectors are on by default and **predictive optimization already runs `OPTIMIZE`** (241k rows sat in one file before this step). No partitioning and no Z-order: both are the wrong tool at this size, and Z-order can't coexist with liquid clustering.
+
+**Incremental processing with Change Data Feed**
+- **Silver records its changes** (`delta.enableChangeDataFeed`), and gold reads only the versions after its watermark in `ops.processed_versions`, rebuilding just the dates that moved and merging them.
+- **Deletes count too:** the keys come from every change type, so a date whose trips were removed is recomputed rather than left counting rows that are gone.
+- **A ranking can't be incremental:** `agg_trips_by_pickup_zip` is rebuilt in full, because one changed trip can move many ZIPs.
+- **Measured on the workspace:** deleting one date's 357 trips made a run rebuild exactly **1 date** (60 → 59 rows); restoring them rebuilt exactly 1 again; an unchanged silver makes the run do nothing at all.
+- **Retries are safe:** a failed task is retried automatically on serverless, and each attempt rolled itself back (`MERGE`, `RESTORE`, `MERGE`, `RESTORE` in the table history) without double-applying anything.
 
 **File ingestion: Auto Loader and checkpoints**
 - **Two kinds of source, one config.** `kind = "table"` is copied in full; `kind = "files"` is read incrementally from a Unity Catalog volume with Auto Loader. The job for each is generated the same way.
@@ -88,7 +97,7 @@ flowchart LR
 
 **Tests and CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml))
 - **Thin notebooks, tested logic:** all transformations live in [`src/medallion/`](src/medallion) as pure DataFrame functions. The notebooks only read, call, write and orchestrate.
-- **56 pytest tests** on local PySpark, with no workspace: key stability, first load wins, the silver/quarantine split, typing, aggregates, quality checks, edge cases (nulls, empty inputs), the write contract, the migration runner (order, drift, naming), and validation of the sources config. One edge-case test caught a real bug: a trip with a null value passed validation, because `null <= 0` is null, not true.
+- **62 pytest tests** on local PySpark, with no workspace: key stability, first load wins, the silver/quarantine split, typing, aggregates, quality checks, edge cases (nulls, empty inputs), the write contract, the migration runner (order, drift, naming), and validation of the sources config. One edge-case test caught a real bug: a trip with a null value passed validation, because `null <= 0` is null, not true.
 - **CI on GitHub, CD from the laptop:** every push runs the tests. Deploys are `databricks bundle deploy` with OAuth, so GitHub holds no Databricks credentials.
 
 ## Project structure
@@ -112,11 +121,12 @@ flowchart LR
 │   │   ├── clean_trips.py
 │   │   └── ddl/                  silver_trips_v001_create.sql, …
 │   ├── 02_gold/
-│   │   ├── build_trip_metrics.py
+│   │   ├── build_trip_metrics.py  incremental from silver's change feed
 │   │   └── ddl/                  gold_…_v001_create.sql, …_to_agg_…_v001_rename.sql
 │   ├── ops/
 │   │   ├── apply_ddl.py          the migration runner
-│   │   └── maintain_tables.py    OPTIMIZE / REORG / VACUUM, weekly
+│   │   ├── maintain_tables.py    OPTIMIZE / REORG / VACUUM, weekly
+│   │   └── ddl/                  ops_processed_versions_v001_create.sql
 │   └── medallion/                sources, bronze, silver, gold, quality, contract, migrations, maintenance: the tested logic
 ├── tests/                        pytest on local PySpark
 ├── scripts/
@@ -201,6 +211,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)               # only needed for
 |---|---|
 | `databricks bundle run apply_ddl --params dry_run=true` | List pending migrations without executing them |
 | `databricks bundle run apply_ddl` | Apply pending migrations in order and record them in `ops.schema_migrations`; a rerun does nothing |
+| `databricks bundle run build_trip_metrics --params full_rebuild=true` | Ignore the watermark and rebuild every date, e.g. after changing an aggregation |
 | `databricks bundle run seed_landing_files --params days=5` | Drop JSON files in the landing volume; dates already written are left alone |
 | `databricks bundle run ingest_landing_trips` | Auto Loader: ingests only files it hasn't seen; a rerun ingests 0 rows |
 | `databricks bundle run maintain_tables` | `OPTIMIZE` + `VACUUM` dry run over every table; `--params optimize_full=true` re-clusters, `vacuum=run` really deletes |
@@ -246,7 +257,7 @@ Useful in the SQL editor: `DESCRIBE HISTORY medallion.01_silver.trips` (what eac
 ## Tests
 
 ```sh
-.venv/bin/pytest                                     # all 56 tests, ~7 s
+.venv/bin/pytest                                     # all 62 tests, ~7 s
 .venv/bin/pytest tests/test_silver.py                # one file
 .venv/bin/pytest -k time_zone                        # by name
 ```

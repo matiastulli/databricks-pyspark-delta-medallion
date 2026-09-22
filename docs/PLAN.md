@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–10 done · next up: **step 11, Change Data Feed**
+**Status:** ✅ all steps done (0–11)
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -17,7 +17,7 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 8. DDL as migrations | ✅ Done | Tables created and changed only by versioned SQL migrations applied by an `apply_ddl` workflow; jobs stop creating tables |
 | 9. Layout + maintenance | ✅ Done | Liquid clustering and Delta table properties through migrations, plus a `maintain_tables` workflow (`OPTIMIZE`, `REORG`, `VACUUM`), measured |
 | 10. Auto Loader | ✅ Done | File ingestion from a UC volume with Auto Loader, `availableNow` and a checkpoint |
-| 11. Change Data Feed | ⏳ Next | An incremental gold built from silver's change feed instead of a full rebuild |
+| 11. Change Data Feed | ✅ Done | An incremental gold built from silver's change feed instead of a full rebuild |
 
 ## Constraints that shape every step
 
@@ -463,15 +463,36 @@ The run output also lists the checkpoint's contents: `offsets/`, `commits/`, `so
 
 **Learned:** Spark Connect's `recentProgress` doesn't carry `numInputRows` for these runs, so the summary counts rows from the table and reports the source's `numFilesOutstanding` (the backlog) instead of inventing a number.
 
-## 11. Change Data Feed: an incremental gold ⏳
+## 11. Change Data Feed: an incremental gold ✅
 
-**Goal:** replace gold's full rebuild with incremental processing, the last big idea in [`docs/databricks.md`](databricks.md) §2 that this project doesn't use.
+**Goal:** replace gold's full rebuild with incremental processing, the last big idea in [`docs/databricks.md`](databricks.md) §2 that this project didn't use.
 
-Planned:
-- `delta.enableChangeDataFeed` on `01_silver.trips` through a migration
-- A gold process reading `table_changes(...)` since the last processed version instead of re-aggregating everything
-- Keep the reconciliation checks, which are exactly what catches an incremental aggregation that drifts from its source
-- Track the last processed version in an `ops` table, next to the migration history
+Built:
+- **`delta.enableChangeDataFeed` on silver** ([`silver_trips_v003_alter.sql`](../src/01_silver/ddl/silver_trips_v003_alter.sql)), so Delta records the row-level inserts, updates and deletes of each version.
+- **A watermark table**, [`ops.processed_versions`](../src/ops/ddl/ops_processed_versions_v001_create.sql): the last source version each process consumed. The migration runner now also accepts `src/ops/ddl/`, ordered after the layer folders.
+- **[`src/medallion/incremental.py`](../src/medallion/incremental.py)** (5 tests): `plan_run` decides full rebuild / incremental / nothing to do, and `changed_keys` collects the keys the feed touched. **A deleted row counts as much as an inserted one:** its date has to be recomputed, or the aggregate keeps counting trips that are gone.
+- **[`build_trip_metrics.py`](../src/02_gold/build_trip_metrics.py) now does both:**
+  - `agg_trips_daily` is **incremental**: read the change feed since the watermark, recompute only those dates from silver, `MERGE` them, and delete dates whose trips are all gone
+  - `agg_trips_by_pickup_zip` is **still a full rebuild**: it's a ranking, and a rank depends on every row, so one changed trip can move many ZIPs
+  - `full_rebuild=true` ignores the watermark, for when an aggregation itself changes
+
+**Checks and rollback.** A full rebuild still checks before writing. An incremental merge can't: the result only exists once merged. So the job notes gold's version, merges, runs the checks, and on failure runs `RESTORE TABLE … TO VERSION AS OF` before failing. The watermark only moves after the checks pass, so a failed run reprocesses the same versions.
+
+Verified on the workspace, in sequence:
+
+| Step | Result |
+|---|---|
+| First run, no watermark | `mode: full`, 60 dates, 13/13 checks, watermark set to silver v18 |
+| Run again, silver unchanged | `mode: none`, nothing read or written |
+| Delete every trip on 2016-01-05 (357 rows), run | `mode: incremental`, **1 date rebuilt**, gold 60 → 59 rows, 13/13 checks |
+| `clean_trips` re-inserts them, run | `mode: incremental`, **1 date rebuilt**, gold back to 60 |
+| Delete a gold date by hand *and* change silver, run | **Run failed**: reconciliation caught it (`got 21475, expected 21833`), and gold was restored to its pre-run version (the 2016-01-07 row was back at 353 trips / 4294.00) |
+| `clean_trips` + `full_rebuild=true` | Everything consistent again: 21,847 trips, 60 dates, 120 ZIPs |
+
+**Learned:**
+- **A failed task is retried automatically on serverless.** The failing run had two attempts, 40 seconds apart, each merging and then restoring itself (`MERGE`, `RESTORE`, `MERGE`, `RESTORE` in the table history). A job that writes has to be safe to run twice; this one is, because the merge is keyed, the rollback is per attempt, and the watermark moves only on success.
+- **`mode: none` skips the checks**, so drift introduced outside the pipeline isn't noticed until something in silver changes. That's the trade for not re-reading everything; a periodic `full_rebuild=true` run is the answer if that matters.
+- The error message from the quality checks no longer says "gold was not written", because on the incremental path it was written and then rolled back.
 
 ---
 

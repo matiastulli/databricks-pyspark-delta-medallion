@@ -23,6 +23,9 @@ resources:
           default: ${var.silver_schema}
         - name: gold_schema
           default: ${var.gold_schema}
+        # Ignore the watermark and rebuild every date from silver, e.g. after changing an aggregation.
+        - name: full_rebuild
+          default: "false"
 
       tasks:
         - task_key: build_trip_metrics

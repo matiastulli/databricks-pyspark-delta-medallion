@@ -1,6 +1,7 @@
 """Table DDL as write-once SQL migrations, versioned per table, applied by a small in-repo runner.
 
-Migrations live next to the code of the schema they belong to, in `src/<NN_layer>/ddl/`:
+Migrations live next to the code of the schema they belong to, in `src/<NN_layer>/ddl/` (and `src/ops/ddl/` for
+tooling tables, which run last):
 
     src/00_bronze/ddl/schemas_v001_create.sql
     src/00_bronze/ddl/bronze_trips_v001_create.sql
@@ -23,11 +24,13 @@ from pathlib import Path
 # src/medallion/migrations.py -> src/. The bundle deploys src/ as a whole, so this works on Databricks too.
 SRC_DIR = Path(__file__).resolve().parents[1]
 
-LAYER_FOLDER = re.compile(r"^(?P<order>\d{2})_(?P<layer>bronze|silver|gold)$")
+# A layer folder (00_bronze …) or `ops`, which holds tooling tables and runs last, after the layers it supports.
+LAYER_FOLDER = re.compile(r"^(?:(?P<order>\d{2})_(?P<layer>bronze|silver|gold)|(?P<ops>ops))$")
+OPS_ORDER = 99
 # <layer>_<table>_v<NNN>_<verb>.sql or schemas_v<NNN>_<verb>.sql (see the naming convention in docs/PLAN.md):
 # the subject first, so a table's files sort together, then its version, then what that version does.
 FILE_NAME = re.compile(
-    r"^(?:(?P<schemas>schemas)|(?P<layer>bronze|silver|gold)_(?P<table>[a-z][a-z0-9_]*?))_v(?P<version>\d{3})_(?P<verb>create|alter|rename|drop)\.sql$"
+    r"^(?:(?P<schemas>schemas)|(?P<layer>bronze|silver|gold|ops)_(?P<table>[a-z][a-z0-9_]*?))_v(?P<version>\d{3})_(?P<verb>create|alter|rename|drop)\.sql$"
 )
 PLACEHOLDER = re.compile(r"\$\{([a-z_]+)\}")
 PLACEHOLDERS = ("catalog", "bronze_schema", "silver_schema", "gold_schema")
@@ -64,17 +67,18 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
         parts = Path(path).parts
         folder = LAYER_FOLDER.match(parts[0]) if len(parts) == 3 and parts[1] == "ddl" else None
         if not folder:
-            problems.append(f"{path}: must be in src/<NN_layer>/ddl/, e.g. 00_bronze/ddl/")
+            problems.append(f"{path}: must be in src/<NN_layer>/ddl/ or src/ops/ddl/, e.g. 00_bronze/ddl/")
             continue
         name = FILE_NAME.match(parts[2])
         if not name:
             problems.append(f"{path}: must be named <layer>_<table>_v<NNN>_<create|alter|rename|drop>.sql or schemas_v<NNN>_<verb>.sql")
             continue
         version, verb = int(name["version"]), name["verb"]
+        folder_layer = folder["layer"] or folder["ops"]
         if name["schemas"]:
             key, renamed_from = SCHEMAS, None
         else:
-            if name["layer"] != folder["layer"]:
+            if name["layer"] != folder_layer:
                 problems.append(f"{path}: a {name['layer']} migration can't live in {parts[0]}/")
                 continue
             key, renamed_from = f"{name['layer']}_{name['table']}", None
@@ -89,7 +93,7 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
             problems.append(f"{path}: {verb} can only be v001; change an existing table with alter")
         if verb not in ("create", "rename") and version == 1:
             problems.append(f"{path}: v001 must create the table (or rename another table into it)")
-        migrations.append(Migration(key, version, verb, path, sql, int(folder["order"]), renamed_from))
+        migrations.append(Migration(key, version, verb, path, sql, int(folder["order"]) if folder["order"] else OPS_ORDER, renamed_from))
 
     by_key: dict[str, list[Migration]] = {}
     for migration in migrations:

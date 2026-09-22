@@ -20,7 +20,7 @@ Learning path. `docs/PLAN.md` is the only place that tracks it: update its statu
 8. Table DDL as versioned migrations (`src/<NN_layer>/ddl/<layer>_<table>_v<NNN>_<verb>.sql`, versioned per table; renames `<layer>_<old>_to_<new>_v001_rename.sql`; applied by the `apply_ddl` workflow), so jobs stop creating tables. **DDL holds only final (published) tables.** Intermediates inside one transformation (DataFrames, temp views, CTEs, or a `_tmp_` table created and dropped within a run) never go in the `ddl/` folders. In-repo migration runner; schemas created by a migration (not the bundle `schema` resource: dev mode renames it to `dev_<user>_<name>` and `bundle destroy` drops it with its data, tested). Table naming convention in `docs/PLAN.md` step 8: bronze `<source_system>_<source_table>`, silver plural `<entity>` + `<entity>_quarantine`, gold `fct_`/`dim_`/`agg_<subject>_<grain>`, temp `_tmp_<process>_<purpose>`, no layer in table names. Done
 9. Delta layout + maintenance: liquid clustering and table properties (`optimizeWrite`, `autoCompact`) through migrations, and a `maintain_tables` workflow (`OPTIMIZE`, `REORG … APPLY (PURGE)`, `VACUUM`), with before/after measurements. Z-order and partitioning are deliberately out (see `docs/PLAN.md` step 9). Note: deletion vectors are on by default and **predictive optimization already runs `OPTIMIZE`** on these tables, so this step demonstrates and measures rather than fixes
 10. Auto Loader: file ingestion from the `landing` UC volume with `availableNow` and a checkpoint; `config/sources.toml` gains `kind` (`table` | `files`)
-11. Change Data Feed: an incremental gold from silver's change feed
+11. Change Data Feed: `agg_trips_daily` is built incrementally from silver's change feed with a watermark in `ops.processed_versions`; the ZIP ranking stays a full rebuild because a rank depends on every row
 
 
 ## Environment
@@ -58,7 +58,8 @@ databricks bundle run seed_landing_files --params days=5     # drop JSON files i
 databricks bundle run ingest_landing_trips                   # Auto Loader: only files it hasn't seen; a rerun ingests 0 rows
 .venv/bin/python scripts/new_bronze_migration.py <name>      # generate src/00_bronze/ddl/bronze_<name>_v001_create.sql from the source schema (--dry-run prints)
 databricks bundle run clean_trips                            # must report rows_inserted: 0 on reruns
-databricks bundle run build_trip_metrics                     # fails with DataQualityError if a check fails
+databricks bundle run build_trip_metrics                     # incremental from silver's change feed; fails with DataQualityError if a check fails
+databricks bundle run build_trip_metrics --params full_rebuild=true   # ignore the watermark and rebuild every date
 databricks bundle run maintain_tables                        # weekly Delta maintenance; --params optimize_full=true re-clusters, vacuum=run really deletes
 .venv/bin/python scripts/measure_pruning.py "<query>"        # files read vs pruned, from query history (reports if it came from cache)
 databricks jobs list-runs --job-id <id> --limit 3            # the run's `trigger` field shows TABLE / PERIODIC / ONE_TIME
@@ -82,6 +83,7 @@ Layout: notebooks are Databricks source files (`# Databricks notebook source`, `
 - `quality.py`: `gold_checks`, `raise_if_any_failed`
 - `contract.py`: `schema_mismatches`, `raise_if_schema_mismatch`. Every job calls it before writing, because Delta silently accepts a missing nullable column and castable types (verified)
 - `migrations.py`: parsing, run order, pending/drift detection, statement splitting, placeholders, bronze DDL generation
+- `incremental.py`: `plan_run` (full / incremental / nothing to do) and `changed_keys` from a change feed
 - `maintenance.py`: `tables_to_maintain` (skips `_tmp_`), `describe_change` (before/after files and size)
 
 New logic goes into `src/medallion/` with tests. `DeltaTable` `MERGE`s and table writes stay in the notebooks, because the tests use plain local Spark without Delta.
@@ -118,6 +120,14 @@ Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no
 - These are UC managed tables, so **predictive optimization already runs `OPTIMIZE`** and deletion vectors are on by default. Don't claim the repo fixed a small-file problem; it demonstrates and measures.
 - `maintain_tables` is the only job that runs `OPTIMIZE` / `REORG` / `VACUUM`. `VACUUM` stays on `dry_run` unless asked: it shortens time travel.
 - Measure layout claims with `scripts/measure_pruning.py`. Query history redacts the SQL, so it matches runs by `statement_id`; the result cache must be busted with a varying predicate, not a comment.
+
+**Incremental gold (step 11).**
+- Silver has Change Data Feed on. `build_trip_metrics` reads `table_changes` since the watermark in `<catalog>.ops.processed_versions`, recomputes only the dates that moved, and `MERGE`s them; dates whose trips are all gone are deleted.
+- **A deleted row matters as much as an inserted one:** `changed_keys` takes every change type, not just inserts.
+- The ZIP ranking is rebuilt in full on purpose: a rank depends on every row.
+- Incremental runs can only check *after* writing, so the job notes gold's version first and runs `RESTORE TABLE … TO VERSION AS OF` if a check fails. The watermark moves only after the checks pass.
+- **Serverless retries a failed task automatically** (verified: two attempts, each rolling itself back). Anything that writes must be safe to run twice.
+- `ops` migrations live in `src/ops/ddl/` (`ops_<table>_v<NNN>_<verb>.sql`) and run after the layer folders.
 
 ## Working agreements
 

@@ -44,6 +44,18 @@ def test_run_order_is_schemas_then_layer_folders_then_table_then_version():
     ]
 
 
+def test_ops_migrations_run_after_the_layers_they_support():
+    assert run_order(
+        "ops/ddl/ops_processed_versions_v001_create.sql",
+        "02_gold/ddl/gold_agg_trips_daily_v001_create.sql",
+        "00_bronze/ddl/schemas_v001_create.sql",
+    ) == [
+        "00_bronze/ddl/schemas_v001_create.sql",
+        "02_gold/ddl/gold_agg_trips_daily_v001_create.sql",
+        "ops/ddl/ops_processed_versions_v001_create.sql",
+    ]
+
+
 def test_a_renamed_table_runs_after_the_table_it_renames_even_if_its_name_sorts_first():
     # "nyctaxi_trips" sorts before "trips"; on a fresh catalog the rename must still wait for trips to be created.
     assert run_order(
