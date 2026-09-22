@@ -23,8 +23,8 @@ def load_resources(bundle: Bundle) -> Resources:
             Job.from_dict(
                 {
                     "name": f"ingest_{source.name}",
-                    "description": f"Bronze: {source.table} -> {source.name} ({source.mode}). Generated from config/sources.toml",
-                    "tags": {"layer": "bronze", "source": source.name},
+                    "description": f"Bronze: {source.location} -> {source.name} ({source.kind}, {source.mode}). Generated from config/sources.toml",
+                    "tags": {"layer": "bronze", "source": source.name, "kind": source.kind},
                     "schedule": {"quartz_cron_expression": source.schedule, "timezone_id": "UTC"},
                     "max_concurrent_runs": 1,
                     # Job parameters become notebook widgets. `source` is a parameter too, so a run can be started
@@ -35,7 +35,8 @@ def load_resources(bundle: Bundle) -> Resources:
                         {"name": "bronze_schema", "default": "${var.bronze_schema}"},
                     ],
                     # No cluster settings: serverless, the only option on Free Edition.
-                    "tasks": [{"task_key": "ingest", "notebook_task": {"notebook_path": "src/00_bronze/ingest.py"}}],
+                    # A table source is copied by ingest.py; files are picked up incrementally by Auto Loader.
+                    "tasks": [{"task_key": "ingest", "notebook_task": {"notebook_path": f"src/00_bronze/ingest{'_files' if source.kind == 'files' else ''}.py"}}],
                 }
             ),
         )

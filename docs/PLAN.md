@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–9 done · next up: **step 10, Auto Loader**
+**Status:** steps 0–10 done · next up: **step 11, Change Data Feed**
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -16,8 +16,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 7. Complete tests | ✅ Done | The rest of the transformations as pure functions, with full pytest coverage |
 | 8. DDL as migrations | ✅ Done | Tables created and changed only by versioned SQL migrations applied by an `apply_ddl` workflow; jobs stop creating tables |
 | 9. Layout + maintenance | ✅ Done | Liquid clustering and Delta table properties through migrations, plus a `maintain_tables` workflow (`OPTIMIZE`, `REORG`, `VACUUM`), measured |
-| 10. Auto Loader | ⏳ Next | File ingestion from a UC volume with Auto Loader, `availableNow` and a checkpoint |
-| 11. Change Data Feed | 🔜 Planned | An incremental gold built from silver's change feed instead of a full rebuild |
+| 10. Auto Loader | ✅ Done | File ingestion from a UC volume with Auto Loader, `availableNow` and a checkpoint |
+| 11. Change Data Feed | ⏳ Next | An incremental gold built from silver's change feed instead of a full rebuild |
 
 ## Constraints that shape every step
 
@@ -431,19 +431,39 @@ So file skipping went from nothing to half the table, on a table where every fil
 - Query history reports pruning: `pruned_files_count`, `read_files_count`, `pruned_bytes`, `rows_read_count`, via **GET** `/api/2.0/sql/history/queries?include_metrics=true` (the POST form doesn't exist in this CLI). So the clustering effect can be measured rather than asserted.
 - `DESCRIBE DETAIL` can't be used as a subquery the way `DESCRIBE HISTORY` can; run it on its own and read the columns.
 
-## 10. File ingestion: Auto Loader and checkpoints ⏳
+## 10. File ingestion: Auto Loader and checkpoints ✅
 
-**Goal:** close the biggest gap against [`docs/databricks.md`](databricks.md) §5. Bronze currently reads *tables*, so nothing here uses Auto Loader, Structured Streaming, triggers or checkpoints.
+**Goal:** close the biggest gap against [`docs/databricks.md`](databricks.md) §5. Bronze read only *tables*, so nothing here used Auto Loader, Structured Streaming, triggers or checkpoints.
 
-Planned:
-- Land sample files in a Unity Catalog volume (export a slice of the trips sample), so there's a real file source
-- A bronze process reading them with Auto Loader (`cloudFiles`), `trigger(availableNow=True)` and its own checkpoint, writing the same bronze table shape
-- Show the checkpoint's `offsets/` / `commits/` / `sources/` contents, and that a rerun ingests nothing new
-- Show what happens when new files land, and what deleting the checkpoint would do (described, not done to the real table)
-- `maxFilesPerTrigger` to cap a backlog
-- Keep the table-based ingestion for the other sources: the config gets a source *kind*
+Built:
+- **A Unity Catalog volume, created by DDL** like everything else: [`bronze_landing_v001_create.sql`](../src/00_bronze/ddl/bronze_landing_v001_create.sql). Files land under `/Volumes/medallion/00_bronze/landing/<source>/`, and the Auto Loader checkpoints live beside them under `landing/_checkpoints/`.
+- **`kind` in `config/sources.toml`.** A source is either a `table` (copied by `ingest.py`) or `files` (picked up by `ingest_files.py`), and each kind requires its own settings, which the config validation enforces. Both kinds keep the same naming convention: for files the "source system" is the volume, so `landing/trips` becomes `landing_trips` and the job is `ingest_landing_trips`. `resources/__init__.py` picks the notebook from the kind.
+- **[`src/00_bronze/seed_landing_files.py`](../src/00_bronze/seed_landing_files.py)** (job `seed_landing_files`, no schedule) writes one JSON folder per pickup date, standing in for the system that would drop files. `mode("ignore")` leaves dates already written alone, so raising `days` makes *new* files arrive.
+- **[`src/00_bronze/ingest_files.py`](../src/00_bronze/ingest_files.py)** reads with `cloudFiles`:
+  - `trigger(availableNow=True)`: take everything that has arrived, then stop. Same code as a live stream, run on a schedule.
+  - the checkpoint lives in the volume, one per source
+  - **the schema comes from the target table**, not from inference, so a file that no longer matches the DDL fails instead of quietly changing the table. That also makes `cloudFiles.schemaLocation` unnecessary.
+  - `maxFilesPerTrigger` caps a batch, so a backlog becomes several normal batches instead of one that runs out of memory
+  - the same metadata columns and write contract as the table path
 
-## 11. Change Data Feed: an incremental gold 🔜
+Verified on the workspace, in one sequence:
+
+| Step | Result |
+|---|---|
+| Seed 3 dates, then ingest | **940 rows** (326 + 338 + 276) |
+| Ingest again, nothing new landed | **0 rows** |
+| Seed 2 more dates, then ingest | **684 rows** (325 + 359), only the new files |
+
+The run output also lists the checkpoint's contents: `offsets/`, `commits/`, `sources/`, `metadata` — the same structure `docs/databricks.md` §5 describes, without `state/`, because nothing here is stateful.
+
+**Decisions:**
+- **The volume is DDL,** not something a job creates. A volume is a governed UC object like a table.
+- **Files are append-only:** `mode = "overwrite"` is rejected for a files source, because incremental ingestion and replacing the table on every run are contradictory.
+- **Bronze keeps both kinds side by side** instead of replacing the table sources. The point is to show both, and the samples aren't files.
+
+**Learned:** Spark Connect's `recentProgress` doesn't carry `numInputRows` for these runs, so the summary counts rows from the table and reports the source's `numFilesOutstanding` (the backlog) instead of inventing a number.
+
+## 11. Change Data Feed: an incremental gold ⏳
 
 **Goal:** replace gold's full rebuild with incremental processing, the last big idea in [`docs/databricks.md`](databricks.md) §2 that this project doesn't use.
 

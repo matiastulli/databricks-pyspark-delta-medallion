@@ -1,0 +1,24 @@
+resources:
+  jobs:
+    seed_landing_files:
+      name: seed_landing_files
+      description: Writes JSON files into the landing volume, standing in for the system that would drop them there
+      tags:
+        layer: bronze
+
+      # No schedule: run it by hand when you want new files to arrive.
+      max_concurrent_runs: 1
+
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: bronze_schema
+          default: ${var.bronze_schema}
+        # How many pickup dates to write. Raising it drops new files; dates already written are left alone.
+        - name: days
+          default: "3"
+
+      tasks:
+        - task_key: seed_landing_files
+          notebook_task:
+            notebook_path: ../src/00_bronze/seed_landing_files.py

@@ -19,7 +19,7 @@ Learning path. `docs/PLAN.md` is the only place that tracks it: update its statu
 7. Complete tests: the remaining transformations and edge cases
 8. Table DDL as versioned migrations (`src/<NN_layer>/ddl/<layer>_<table>_v<NNN>_<verb>.sql`, versioned per table; renames `<layer>_<old>_to_<new>_v001_rename.sql`; applied by the `apply_ddl` workflow), so jobs stop creating tables. **DDL holds only final (published) tables.** Intermediates inside one transformation (DataFrames, temp views, CTEs, or a `_tmp_` table created and dropped within a run) never go in the `ddl/` folders. In-repo migration runner; schemas created by a migration (not the bundle `schema` resource: dev mode renames it to `dev_<user>_<name>` and `bundle destroy` drops it with its data, tested). Table naming convention in `docs/PLAN.md` step 8: bronze `<source_system>_<source_table>`, silver plural `<entity>` + `<entity>_quarantine`, gold `fct_`/`dim_`/`agg_<subject>_<grain>`, temp `_tmp_<process>_<purpose>`, no layer in table names. Done
 9. Delta layout + maintenance: liquid clustering and table properties (`optimizeWrite`, `autoCompact`) through migrations, and a `maintain_tables` workflow (`OPTIMIZE`, `REORG … APPLY (PURGE)`, `VACUUM`), with before/after measurements. Z-order and partitioning are deliberately out (see `docs/PLAN.md` step 9). Note: deletion vectors are on by default and **predictive optimization already runs `OPTIMIZE`** on these tables, so this step demonstrates and measures rather than fixes
-10. Auto Loader: file ingestion from a UC volume with `availableNow` and a checkpoint
+10. Auto Loader: file ingestion from the `landing` UC volume with `availableNow` and a checkpoint; `config/sources.toml` gains `kind` (`table` | `files`)
 11. Change Data Feed: an incremental gold from silver's change feed
 
 
@@ -54,6 +54,8 @@ databricks bundle deploy                                     # dev target: jobs 
 databricks bundle run apply_ddl --params dry_run=true        # list pending DDL migrations without executing them
 databricks bundle run apply_ddl                              # apply pending migrations (run after deploy, before pipelines); reruns do nothing
 databricks bundle run ingest_nyctaxi_trips                   # any ingest_<source>; prints the notebook's exit JSON
+databricks bundle run seed_landing_files --params days=5     # drop JSON files in the landing volume (dates already written are left alone)
+databricks bundle run ingest_landing_trips                   # Auto Loader: only files it hasn't seen; a rerun ingests 0 rows
 .venv/bin/python scripts/new_bronze_migration.py <name>      # generate src/00_bronze/ddl/bronze_<name>_v001_create.sql from the source schema (--dry-run prints)
 databricks bundle run clean_trips                            # must report rows_inserted: 0 on reruns
 databricks bundle run build_trip_metrics                     # fails with DataQualityError if a check fails
@@ -85,7 +87,12 @@ Layout: notebooks are Databricks source files (`# Databricks notebook source`, `
 New logic goes into `src/medallion/` with tests. `DeltaTable` `MERGE`s and table writes stay in the notebooks, because the tests use plain local Spark without Delta.
 
 **One workflow per process** (the user's production practice):
-- Bronze is config-driven. `config/sources.toml` lists every source (`table`, `mode` = `append` | `overwrite`, `schedule` = Quartz cron in UTC). The bronze table and job names are derived from `table` (`<source_system>_<source_table>`), never configured.
+- Bronze is config-driven. `config/sources.toml` lists every source with a `kind`:
+  - `kind = "table"`: `table`, `mode` (`append` | `overwrite`), `schedule`. Copied by `00_bronze/ingest.py`.
+  - `kind = "files"`: `volume`, `path`, `format`, `mode` (`append` only), `schedule`. Picked up by `00_bronze/ingest_files.py` with Auto Loader, `availableNow` and a checkpoint under `/Volumes/<catalog>/<bronze_schema>/<volume>/_checkpoints/<name>/`.
+  - Names are always derived, never configured: `<source_system>_<source_table>` for tables, `<volume>_<path>` for files (`landing_trips`).
+  - **Never delete a checkpoint to "clean up":** it isn't a reset, it's a full reprocess, and bronze is append-only.
+  - Auto Loader reads with the **target table's schema**, so a changed file fails instead of changing the table; the fix is a migration.
 - `resources/__init__.py` (Python-defined bundle resources, `databricks-bundles` pinned to the CLI version) generates one job `ingest_<name>` per entry. Each job runs `00_bronze/ingest.py` with job parameter `source` on its own schedule.
 - `clean_trips` (silver) and `build_trip_metrics` (gold scorecard) are YAML jobs with **table update triggers** on their input table.
 - Add a bronze table by adding a config entry. Never add a notebook or job YAML for it, and never put all sources in one job.

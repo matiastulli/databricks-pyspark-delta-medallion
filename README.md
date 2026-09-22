@@ -16,23 +16,25 @@ It was built one step at a time. The plan, the decisions and what each step veri
 
 ```mermaid
 flowchart LR
-    CFG["config/sources.toml<br/>table · mode · schedule"] -. generates one job per source .-> I
+    CFG["config/sources.toml<br/>kind · table or volume<br/>mode · schedule"] -. generates one job per source .-> I
 
-    subgraph SRC["samples catalog"]
+    subgraph SRC["sources"]
         direction TB
-        N["nyctaxi.trips"]
-        T["tpch.* (7 tables)"]
+        N["samples.nyctaxi.trips"]
+        T["samples.tpch.* (7 tables)"]
+        F["JSON files in the<br/>landing volume"]
     end
 
     subgraph UC["Unity Catalog · medallion"]
         direction LR
-        B["<b>00_bronze</b><br/>nyctaxi_trips (append)<br/>tpch_* (overwrite)"]
+        B["<b>00_bronze</b><br/>nyctaxi_trips (append)<br/>tpch_* (overwrite)<br/>landing_trips (files)"]
         S["<b>01_silver</b><br/>trips<br/>trips_quarantine"]
         G["<b>02_gold</b><br/>agg_trips_daily<br/>agg_trips_by_pickup_zip"]
     end
 
     N --> I["ingest_&lt;source&gt;<br/>scheduled jobs"]
     T --> I
+    F -->|"Auto Loader<br/>availableNow + checkpoint"| I
     I --> B
     B -->|"table update trigger"| C["clean_trips"]
     C --> S
@@ -42,7 +44,7 @@ flowchart LR
 
 | Layer | `src/` folder | Unity Catalog schema | Contents |
 |---|---|---|---|
-| Bronze | `src/00_bronze/` | `medallion.00_bronze` | Sources copied as is, plus `_batch_id`, `_ingested_at`, `_source_table`, `_source_file` |
+| Bronze | `src/00_bronze/` | `medallion.00_bronze` | Sources copied as is, plus `_batch_id`, `_ingested_at`, `_source_table`, `_source_file`. Tables are copied in full; files in the `landing` volume are picked up incrementally by Auto Loader |
 | Silver | `src/01_silver/` | `medallion.01_silver` | `trips`: deduplicated, validated, typed; `trips_quarantine`: rejected trips with their reasons |
 | Gold | `src/02_gold/` | `medallion.02_gold` | `agg_trips_daily`, `agg_trips_by_pickup_zip`: the trip scorecard |
 | Ops | `src/ops/` | `medallion.ops` | `apply_ddl` applies DDL migrations and records them in `schema_migrations`; `maintain_tables` runs the weekly `OPTIMIZE` / `VACUUM` |
@@ -72,6 +74,12 @@ flowchart LR
 - **A weekly [`maintain_tables`](resources/maintain_tables_job.yml) workflow:** `OPTIMIZE` (the only operation that re-clusters), optional `REORG TABLE … APPLY (PURGE)` to materialize deletion vectors, and `VACUUM` in dry run by default, since it shortens time travel. It reports files, size and clustering before and after.
 - **What Databricks already does here:** these are Unity Catalog managed tables, so deletion vectors are on by default and **predictive optimization already runs `OPTIMIZE`** (241k rows sat in one file before this step). No partitioning and no Z-order: both are the wrong tool at this size, and Z-order can't coexist with liquid clustering.
 
+**File ingestion: Auto Loader and checkpoints**
+- **Two kinds of source, one config.** `kind = "table"` is copied in full; `kind = "files"` is read incrementally from a Unity Catalog volume with Auto Loader. The job for each is generated the same way.
+- **`trigger(availableNow=True)`:** the same streaming code run as a batch job on a schedule, keeping its checkpoint, so each run starts exactly where the last one stopped.
+- **Proven incremental, on the workspace:** 3 days of files → 940 rows; rerun with nothing new → **0 rows**; 2 more days land → **684 rows**, only the new files. The run output lists the checkpoint's `offsets/`, `commits/`, `sources/`.
+- **The schema comes from the target table**, not from inference, so a file that stops matching the DDL fails the run instead of changing the table.
+
 **Databricks workflows as code** ([`databricks.yml`](databricks.yml), [`resources/`](resources))
 - **One workflow per process:** eight `ingest_<source>` jobs (daily, twice a month, monthly), `clean_trips` (silver) and `build_trip_metrics` (the gold scorecard).
 - **Generated jobs:** [`resources/__init__.py`](resources/__init__.py) uses Python-defined bundle resources to create one ingestion job per entry in [`config/sources.toml`](config/sources.toml). Adding bronze table #41 is a config entry: no notebook, no job YAML.
@@ -80,14 +88,14 @@ flowchart LR
 
 **Tests and CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml))
 - **Thin notebooks, tested logic:** all transformations live in [`src/medallion/`](src/medallion) as pure DataFrame functions. The notebooks only read, call, write and orchestrate.
-- **49 pytest tests** on local PySpark, with no workspace: key stability, first load wins, the silver/quarantine split, typing, aggregates, quality checks, edge cases (nulls, empty inputs), the write contract, the migration runner (order, drift, naming), and validation of the sources config. One edge-case test caught a real bug: a trip with a null value passed validation, because `null <= 0` is null, not true.
+- **56 pytest tests** on local PySpark, with no workspace: key stability, first load wins, the silver/quarantine split, typing, aggregates, quality checks, edge cases (nulls, empty inputs), the write contract, the migration runner (order, drift, naming), and validation of the sources config. One edge-case test caught a real bug: a trip with a null value passed validation, because `null <= 0` is null, not true.
 - **CI on GitHub, CD from the laptop:** every push runs the tests. Deploys are `databricks bundle deploy` with OAuth, so GitHub holds no Databricks credentials.
 
 ## Project structure
 
 ```
 ├── config/
-│   └── sources.toml              bronze sources: table, load mode, schedule
+│   └── sources.toml              bronze sources: kind (table | files), load mode, schedule
 ├── resources/
 │   ├── __init__.py               generates one ingest_<source> job per config entry
 │   ├── apply_ddl_job.yml         applies pending DDL migrations
@@ -96,7 +104,9 @@ flowchart LR
 │   └── build_trip_metrics_job.yml  gold scorecard workflow (table update trigger)
 ├── src/
 │   ├── 00_bronze/
-│   │   ├── ingest.py             one generic notebook for every source
+│   │   ├── ingest.py             one generic notebook for every table source
+│   │   ├── ingest_files.py       Auto Loader: files from the landing volume
+│   │   ├── seed_landing_files.py drops JSON files in the volume, standing in for an external system
 │   │   └── ddl/                  schemas_v001_create.sql, bronze_<table>_v001_create.sql, …_v001_rename.sql
 │   ├── 01_silver/
 │   │   ├── clean_trips.py
@@ -191,6 +201,8 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)               # only needed for
 |---|---|
 | `databricks bundle run apply_ddl --params dry_run=true` | List pending migrations without executing them |
 | `databricks bundle run apply_ddl` | Apply pending migrations in order and record them in `ops.schema_migrations`; a rerun does nothing |
+| `databricks bundle run seed_landing_files --params days=5` | Drop JSON files in the landing volume; dates already written are left alone |
+| `databricks bundle run ingest_landing_trips` | Auto Loader: ingests only files it hasn't seen; a rerun ingests 0 rows |
 | `databricks bundle run maintain_tables` | `OPTIMIZE` + `VACUUM` dry run over every table; `--params optimize_full=true` re-clusters, `vacuum=run` really deletes |
 | `.venv/bin/python scripts/measure_pruning.py "<query>"` | Files read vs pruned for a query, from query history |
 | `.venv/bin/python scripts/new_bronze_migration.py <name>` | Generate a bronze table's `…_v001_create.sql` from its source schema (`--dry-run` prints it) |
@@ -234,7 +246,7 @@ Useful in the SQL editor: `DESCRIBE HISTORY medallion.01_silver.trips` (what eac
 ## Tests
 
 ```sh
-.venv/bin/pytest                                     # all 49 tests, ~7 s
+.venv/bin/pytest                                     # all 56 tests, ~7 s
 .venv/bin/pytest tests/test_silver.py                # one file
 .venv/bin/pytest -k time_zone                        # by name
 ```
