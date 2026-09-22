@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** steps 0–8 done · next up: **step 9, Delta table layout and maintenance**
+**Status:** steps 0–9 done · next up: **step 10, Auto Loader**
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -15,8 +15,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 6. Scale out | ✅ Done | Generic ingestion driven by `config/sources.toml`, one scheduled job per source, and silver/gold jobs triggered by table updates |
 | 7. Complete tests | ✅ Done | The rest of the transformations as pure functions, with full pytest coverage |
 | 8. DDL as migrations | ✅ Done | Tables created and changed only by versioned SQL migrations applied by an `apply_ddl` workflow; jobs stop creating tables |
-| 9. Layout + maintenance | ⏳ Next | Liquid clustering and Delta table properties through migrations, plus a `maintain_tables` workflow (`OPTIMIZE`, `REORG`, `VACUUM`), measured |
-| 10. Auto Loader | 🔜 Planned | File ingestion from a UC volume with Auto Loader, `availableNow` and a checkpoint |
+| 9. Layout + maintenance | ✅ Done | Liquid clustering and Delta table properties through migrations, plus a `maintain_tables` workflow (`OPTIMIZE`, `REORG`, `VACUUM`), measured |
+| 10. Auto Loader | ⏳ Next | File ingestion from a UC volume with Auto Loader, `availableNow` and a checkpoint |
 | 11. Change Data Feed | 🔜 Planned | An incremental gold built from silver's change feed instead of a full rebuild |
 
 ## Constraints that shape every step
@@ -262,9 +262,9 @@ Built:
   - If a transformation ever needs a temporary **persisted** table (for example, to break up a very long plan), the job creates it and drops it at the end of the run, and it stays out of the `ddl/` folders. Its name must make that clear, e.g. a `_tmp_` prefix.
 
 **Decisions (the user's):**
-- **Migrations live next to their schema's code, versioned per table:** `src/<NN_layer>/ddl/<verb>_<layer>_<table>_v<NNN>.sql`, e.g. `src/01_silver/ddl/create_silver_trips_v001.sql`. Each table has its own version sequence, and the version goes at the end of the file name. They are deployed with the rest of `src/`.
+- **Migrations live next to their schema's code, versioned per table:** `src/<NN_layer>/ddl/<layer>_<table>_v<NNN>_<verb>.sql`, e.g. `src/01_silver/ddl/silver_trips_v001_create.sql`. Each table has its own version sequence, and the version goes at the end of the file name. They are deployed with the rest of `src/`.
 - **Runner: a small in-repo runner,** not Flyway or Liquibase. It keeps the project PySpark-only and is small enough to test fully.
-- **Schemas move into a migration** (`src/00_bronze/ddl/create_schemas_v001.sql`), not the bundle's `schema` resource. We tested the bundle resource on Free Edition with a throwaway bundle, and it showed two problems:
+- **Schemas move into a migration** (`src/00_bronze/ddl/schemas_v001_create.sql`), not the bundle's `schema` resource. We tested the bundle resource on Free Edition with a throwaway bundle, and it showed two problems:
   - **development mode renames the schemas:** `zz_schema_probe` was created as `medallion.dev_jmatiastulli_zz_schema_probe`, so in `dev` the bundle would create parallel schemas instead of adopting `00_bronze`, `01_silver` and `02_gold`
   - **`bundle destroy` dropped the schema together with a table holding data**
 
@@ -297,9 +297,9 @@ Built:
 - Keys: `<entity>_id`, e.g. `trip_id`; booleans: `is_<state>` / `has_<thing>`
 
 *Migrations*
-- `src/<NN_layer>/ddl/<create|alter|rename|drop>_<layer>_<table>_v<NNN>.sql`, with versions counted **per table** from `v001`, e.g. `create_silver_trips_v001.sql`, then `alter_silver_trips_v002.sql`
-- The schemas: `src/00_bronze/ddl/create_schemas_v001.sql`
-- A table's history starts with `create` (v001). A rename starts the **new** table's history and names both tables: `rename_<layer>_<old>_to_<new>_v001.sql`, e.g. `rename_bronze_trips_to_nyctaxi_trips_v001.sql`
+- `src/<NN_layer>/ddl/<layer>_<table>_v<NNN>_<create|alter|rename|drop>.sql`, with versions counted **per table** from `v001`, e.g. `silver_trips_v001_create.sql`, then `silver_trips_v002_alter.sql`. **The subject comes first and the action last** (the user's call), so a table's whole history sorts together in the folder and reads in version order.
+- The schemas: `src/00_bronze/ddl/schemas_v001_create.sql`
+- A table's history starts with `create` (v001). A rename starts the **new** table's history and names both tables: `<layer>_<old>_to_<new>_v001_rename.sql`, e.g. `bronze_trips_to_nyctaxi_trips_v001_rename.sql`
 - The layer in the file name must match its folder (`silver` only in `01_silver/ddl/`)
 
 *Enforcement*
@@ -319,18 +319,18 @@ Built:
 Planned:
 - **Write-once SQL files in each schema's `ddl/` folder, versioned per table,** for example:
   ```
-  src/00_bronze/ddl/create_schemas_v001.sql                         CREATE SCHEMA IF NOT EXISTS 00_bronze / 01_silver / 02_gold
-  src/00_bronze/ddl/create_bronze_trips_v001.sql                    baseline: the tables exactly as they exist today
-  src/00_bronze/ddl/create_bronze_tpch_region_v001.sql …
-  src/01_silver/ddl/create_silver_trips_v001.sql
-  src/01_silver/ddl/create_silver_trips_quarantine_v001.sql
-  src/02_gold/ddl/create_gold_daily_trips_v001.sql
-  src/02_gold/ddl/create_gold_busiest_pickup_zones_v001.sql
-  src/00_bronze/ddl/rename_bronze_trips_to_nyctaxi_trips_v001.sql   then the naming convention renames
-  src/02_gold/ddl/rename_gold_daily_trips_to_agg_trips_daily_v001.sql
-  src/02_gold/ddl/rename_gold_busiest_pickup_zones_to_agg_trips_by_pickup_zip_v001.sql
+  src/00_bronze/ddl/schemas_v001_create.sql                         CREATE SCHEMA IF NOT EXISTS 00_bronze / 01_silver / 02_gold
+  src/00_bronze/ddl/bronze_trips_v001_create.sql                    baseline: the tables exactly as they exist today
+  src/00_bronze/ddl/bronze_tpch_region_v001_create.sql …
+  src/01_silver/ddl/silver_trips_v001_create.sql
+  src/01_silver/ddl/silver_trips_quarantine_v001_create.sql
+  src/02_gold/ddl/gold_daily_trips_v001_create.sql
+  src/02_gold/ddl/gold_busiest_pickup_zones_v001_create.sql
+  src/00_bronze/ddl/bronze_trips_to_nyctaxi_trips_v001_rename.sql   then the naming convention renames
+  src/02_gold/ddl/gold_daily_trips_to_agg_trips_daily_v001_rename.sql
+  src/02_gold/ddl/gold_busiest_pickup_zones_to_agg_trips_by_pickup_zip_v001_rename.sql
   ```
-  A schema change is always a **new** version of that table (e.g. `alter_silver_trips_v002.sql` with `ALTER TABLE … ADD COLUMNS`). Applied files are never edited.
+  A schema change is always a **new** version of that table (e.g. `silver_trips_v002_alter.sql` with `ALTER TABLE … ADD COLUMNS`). Applied files are never edited.
 - **Baseline first:** the tables already exist with data, so the first migrations must describe them **exactly as they are today** (columns, types, `NOT NULL`, comments). They adopt the tables without rewriting or losing data, and applying them is checked against `DESCRIBE TABLE`.
 - **A small migration runner** in `src/medallion/migrations.py` plus an `apply_ddl` workflow (serverless notebook, `spark.sql`):
   - reads `src/*/ddl/*.sql` and runs them in this order: `schemas` first, then layer folders (00, 01, 02), tables by name, each table's versions ascending, and **a renamed table always after the table it renames**. Otherwise `nyctaxi_trips` would sort before `trips`, and on a fresh catalog the rename would run before `trips` exists.
@@ -360,12 +360,12 @@ Confirmed by the user:
 
 Built and verified on the workspace:
 - **Migrations and runner:**
-  - 17 migrations: the schemas (`create_schemas_v001`, plus `alter_schemas_v002` for the comments), 12 table baselines, and 3 renames
+  - 17 migrations: the schemas (`schemas_v001_create`, plus `schemas_v002_alter` for the comments), 12 table baselines, and 3 renames
   - [`src/medallion/migrations.py`](../src/medallion/migrations.py) holds the logic (18 tests)
   - [`src/ops/apply_ddl.py`](../src/ops/apply_ddl.py) is the runner, deployed as the [`apply_ddl`](../resources/apply_ddl_job.yml) job with `dry_run`
   - [`scripts/setup_unity_catalog.sh`](../scripts/setup_unity_catalog.sh) now creates only the catalog
-- **The baseline matches reality exactly.** All migrations applied to a fresh throwaway catalog produced the same 12 tables as `medallion`: 117 columns with identical order, types, `NOT NULL` and comments, plus identical table comments. The comparison also caught one mismatch: the schema comments in `create_schemas_v001` had been rewritten instead of copied. They were restored in v001 and changed properly in `alter_schemas_v002`.
-- **Drift detection works on Databricks.** Rerunning on the throwaway catalog after that edit failed with `create_schemas_v001.sql changed after it was applied`, and nothing ran.
+- **The baseline matches reality exactly.** All migrations applied to a fresh throwaway catalog produced the same 12 tables as `medallion`: 117 columns with identical order, types, `NOT NULL` and comments, plus identical table comments. The comparison also caught one mismatch: the schema comments in `schemas_v001_create` had been rewritten instead of copied. They were restored in v001 and changed properly in `schemas_v002_alter`.
+- **Drift detection works on Databricks.** Rerunning on the throwaway catalog after that edit failed with `schemas_v001_create.sql changed after it was applied`, and nothing ran.
 - **Adopted without rewriting data.** On `medallion`: dry run, then 14 migrations applied. Every table's Delta version and row count were unchanged, the schema comments were updated by v002, and a rerun applied nothing.
 - **Jobs stopped creating tables.**
   - `ingest.py` and `build_trip_metrics.py` write with `writeTo(...).append()` / `.overwrite(F.lit(True))` instead of `saveAsTable` + `overwriteSchema`
@@ -375,7 +375,7 @@ Built and verified on the workspace:
 - **Schema enforcement, tested on a `_tmp_` table:** Delta rejected an extra column, a null into `NOT NULL`, and an impossible cast. It **accepted a missing nullable column, filling it with null**. So [`src/medallion/contract.py`](../src/medallion/contract.py) (`raise_if_schema_mismatch`, 3 tests) now checks column names and types exactly before every write. Every gold column is nullable, so this is what stops an aggregation that loses a column from publishing nulls.
 - **Naming convention applied:**
   - `config/sources.toml` lost `name` and `target`: bronze names come from `bronze_table_name` (`samples.nyctaxi.trips` → `nyctaxi_trips`), and the job became `ingest_nyctaxi_trips`
-  - three `rename_…_to_…_v001` migrations renamed `trips`, `daily_trips` and `busiest_pickup_zones`
+  - three `…_to_…_v001_rename` migrations renamed `trips`, `daily_trips` and `busiest_pickup_zones`
   - row counts, Delta history versions (16, 20, 20) and comments moved with the tables, and the old names are gone
   - all jobs succeeded under the new names, with 13/13 gold checks
 - **[`scripts/new_bronze_migration.py`](../scripts/new_bronze_migration.py)** reads a source's schema with `DESCRIBE TABLE` on the warehouse. Its output for `tpch_region` was identical to the committed baseline, and it refuses to overwrite an existing migration.
@@ -386,7 +386,7 @@ Built and verified on the workspace:
 
 Note: **least privilege** can only be documented here, not demonstrated. Free Edition has a single user, so the jobs and the migration runner run as the same identity.
 
-## 9. Delta table layout and maintenance ⏳
+## 9. Delta table layout and maintenance ✅
 
 **Goal:** put the Delta layout and maintenance levers from [`docs/databricks.md`](databricks.md) into practice, and **measure** them, rather than repeating the theory.
 
@@ -398,18 +398,28 @@ Note: **least privilege** can only be documented here, not demonstrated. Free Ed
 
 **So the small-file problem doesn't exist here.** Anything this step adds is to show the mechanism and measure it honestly, not to fix a real pain. The plan says so, and the README should too.
 
-Planned:
-- **Table properties through migrations** (`alter_<layer>_<table>_v<NNN>.sql`), so the DDL stays the source of truth: `delta.autoOptimize.optimizeWrite` and `delta.autoOptimize.autoCompact` on the tables that get frequent small writes (bronze `nyctaxi_trips`, silver `trips` and `trips_quarantine`), with a comment in the migration saying what each one does and when it acts (before the write vs after the commit).
-- **Liquid clustering on the one table big enough to show it:** `ALTER TABLE 00_bronze.tpch_orders CLUSTER BY (o_orderdate)`, then `OPTIMIZE` to cluster the existing data.
-  - **Measured, not assumed:** run the same `WHERE o_orderdate = …` query before and after, and compare the files read from the query history metrics (`/api/2.0/sql/history/queries`). Record the numbers here, including if the difference turns out to be nothing at this size.
-  - Liquid clustering can't be combined with partitioning or `ZORDER`, so this table picks one and keeps it.
-- **A `maintain_tables` workflow** (`src/ops/maintain_tables.py`, weekly, paused in dev like everything else):
-  - `DESCRIBE DETAIL` before and after, reporting files, size and clustering per table
-  - `OPTIMIZE` each table (the only operation that re-clusters; auto compaction only glues files together)
-  - `REORG TABLE … APPLY (PURGE)` to materialize deletion vectors
-  - `VACUUM … DRY RUN` first, with the real `VACUUM` behind a parameter, and retention left at the 7-day default
-  - It returns a JSON summary like the other jobs, so a run shows what changed
-- **Document what we didn't do and why:** no partitioning (Databricks says not under ~1 TB), and predictive optimization already runs `OPTIMIZE`, so our scheduled job is partly a demonstration.
+Built and measured:
+- **Table properties through migrations:** `bronze_nyctaxi_trips_v002_alter.sql`, `silver_trips_v002_alter.sql` and `silver_trips_quarantine_v002_alter.sql` set `delta.autoOptimize.optimizeWrite` and `autoCompact` on the tables that get a write on every run. Each migration says what the property does and when it acts (before the write vs after the commit).
+- **Liquid clustering:** `bronze_tpch_orders_v002_alter.sql` sets `CLUSTER BY (o_orderdate)`, and the first `OPTIMIZE FULL` clustered the existing 7.5M rows.
+- **[`src/ops/maintain_tables.py`](../src/ops/maintain_tables.py)** + [`maintain_tables`](../resources/maintain_tables_job.yml), weekly (Sunday 07:00 UTC, paused in dev): `OPTIMIZE` (with `optimize_full`), optional `REORG TABLE … APPLY (PURGE)`, and `VACUUM` in **dry run by default**. It discovers the tables itself, skips `_tmp_` ones, and reports files, size and clustering before and after. [`src/medallion/maintenance.py`](../src/medallion/maintenance.py) holds the tested part (3 tests).
+- **[`scripts/measure_pruning.py`](../scripts/measure_pruning.py)** runs a query and reports files read vs pruned from query history.
+
+**The measurement, on `00_bronze.tpch_orders` (7.5M rows, 165 MB):**
+
+| Query | Before `CLUSTER BY` | After `CLUSTER BY (o_orderdate)` + `OPTIMIZE FULL` |
+|---|---|---|
+| `WHERE o_orderdate = '1996-01-02'` | 3 of 3 files read, 0 pruned, 37.1 MB read | **1 of 2 files read, 1 pruned**, 35.7 MB pruned |
+| `WHERE o_orderdate BETWEEN … (a month)` | 3 of 3 files read, 0 pruned, 12.1 MB read | **1 of 2 files read, 1 pruned**, 35.7 MB pruned |
+
+So file skipping went from nothing to half the table, on a table where every file previously spanned the full date range. In absolute terms this saves a second at most: the table is 165 MB, and Delta's row-group statistics were already keeping `rows_read` low. The mechanism is what's being shown.
+
+**The maintenance run** (`optimize_full=true`, 12 tables): `tpch_orders` 3 → 2 files and now clustered, silver `trips` 2 → 1, everything else already at 1–2 files. `VACUUM … DRY RUN` found **0 files** to delete anywhere, which is consistent with predictive optimization having already tidied up.
+
+**Learned:**
+- **Query history redacts `query_text`**, so a measurement script can't find its own run by a comment tag. It matches on `statement_id`, which equals `query_id` in history.
+- **The result cache silently ruins a before/after**: the same query returned in 397 ms reading 0 files. Comments don't defeat it, because Databricks normalizes them away; vary a harmless predicate instead. The script reports `from cache` so a cached run can't be mistaken for a fast one.
+- `DESCRIBE DETAIL` can't be used as a subquery, unlike `DESCRIBE HISTORY`.
+- Renaming migration files **breaks the history**, which records each file's path. Renaming all 21 files to the new convention needed a one-off `UPDATE` of `ops.schema_migrations`; after it, `apply_ddl` reported 21 applied and 0 pending with no drift.
 
 **Out of scope, with reasons:**
 - **Z-order:** left out. It can't coexist with liquid clustering on the same table, and adding a table only to demo the legacy approach is noise. `docs/databricks.md` §3 already explains it, including why liquid clustering replaced it. (The user can pull it back in, on a table of its own.)
@@ -421,7 +431,7 @@ Planned:
 - Query history reports pruning: `pruned_files_count`, `read_files_count`, `pruned_bytes`, `rows_read_count`, via **GET** `/api/2.0/sql/history/queries?include_metrics=true` (the POST form doesn't exist in this CLI). So the clustering effect can be measured rather than asserted.
 - `DESCRIBE DETAIL` can't be used as a subquery the way `DESCRIBE HISTORY` can; run it on its own and read the columns.
 
-## 10. File ingestion: Auto Loader and checkpoints 🔜
+## 10. File ingestion: Auto Loader and checkpoints ⏳
 
 **Goal:** close the biggest gap against [`docs/databricks.md`](databricks.md) §5. Bronze currently reads *tables*, so nothing here uses Auto Loader, Structured Streaming, triggers or checkpoints.
 

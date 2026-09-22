@@ -17,7 +17,7 @@ Learning path. `docs/PLAN.md` is the only place that tracks it: update its statu
 5. CI/CD + orchestration, thin and early: high-risk logic as pure functions in `src/` with a few pytest tests, GitHub Actions, and a Databricks Asset Bundle (`databricks.yml`) job running bronze → silver → gold for real
 6. Scale out: generic `00_bronze/ingest.py` driven by `config/sources.toml` (nyctaxi + TPC-H), one generated, scheduled job per source, and silver/gold jobs on table update triggers; `src/` folders per schema, notebooks named by process
 7. Complete tests: the remaining transformations and edge cases
-8. Table DDL as versioned migrations (`src/<NN_layer>/ddl/<verb>_<layer>_<table>_v<NNN>.sql`, versioned per table; renames `rename_<layer>_<old>_to_<new>_v001.sql`; applied by the `apply_ddl` workflow), so jobs stop creating tables. **DDL holds only final (published) tables.** Intermediates inside one transformation (DataFrames, temp views, CTEs, or a `_tmp_` table created and dropped within a run) never go in the `ddl/` folders. In-repo migration runner; schemas created by a migration (not the bundle `schema` resource: dev mode renames it to `dev_<user>_<name>` and `bundle destroy` drops it with its data, tested). Table naming convention in `docs/PLAN.md` step 8: bronze `<source_system>_<source_table>`, silver plural `<entity>` + `<entity>_quarantine`, gold `fct_`/`dim_`/`agg_<subject>_<grain>`, temp `_tmp_<process>_<purpose>`, no layer in table names. Done
+8. Table DDL as versioned migrations (`src/<NN_layer>/ddl/<layer>_<table>_v<NNN>_<verb>.sql`, versioned per table; renames `<layer>_<old>_to_<new>_v001_rename.sql`; applied by the `apply_ddl` workflow), so jobs stop creating tables. **DDL holds only final (published) tables.** Intermediates inside one transformation (DataFrames, temp views, CTEs, or a `_tmp_` table created and dropped within a run) never go in the `ddl/` folders. In-repo migration runner; schemas created by a migration (not the bundle `schema` resource: dev mode renames it to `dev_<user>_<name>` and `bundle destroy` drops it with its data, tested). Table naming convention in `docs/PLAN.md` step 8: bronze `<source_system>_<source_table>`, silver plural `<entity>` + `<entity>_quarantine`, gold `fct_`/`dim_`/`agg_<subject>_<grain>`, temp `_tmp_<process>_<purpose>`, no layer in table names. Done
 9. Delta layout + maintenance: liquid clustering and table properties (`optimizeWrite`, `autoCompact`) through migrations, and a `maintain_tables` workflow (`OPTIMIZE`, `REORG … APPLY (PURGE)`, `VACUUM`), with before/after measurements. Z-order and partitioning are deliberately out (see `docs/PLAN.md` step 9). Note: deletion vectors are on by default and **predictive optimization already runs `OPTIMIZE`** on these tables, so this step demonstrates and measures rather than fixes
 10. Auto Loader: file ingestion from a UC volume with `availableNow` and a checkpoint
 11. Change Data Feed: an incremental gold from silver's change feed
@@ -54,9 +54,11 @@ databricks bundle deploy                                     # dev target: jobs 
 databricks bundle run apply_ddl --params dry_run=true        # list pending DDL migrations without executing them
 databricks bundle run apply_ddl                              # apply pending migrations (run after deploy, before pipelines); reruns do nothing
 databricks bundle run ingest_nyctaxi_trips                   # any ingest_<source>; prints the notebook's exit JSON
-.venv/bin/python scripts/new_bronze_migration.py <name>      # generate src/00_bronze/ddl/create_bronze_<name>_v001.sql from the source schema (--dry-run prints)
+.venv/bin/python scripts/new_bronze_migration.py <name>      # generate src/00_bronze/ddl/bronze_<name>_v001_create.sql from the source schema (--dry-run prints)
 databricks bundle run clean_trips                            # must report rows_inserted: 0 on reruns
 databricks bundle run build_trip_metrics                     # fails with DataQualityError if a check fails
+databricks bundle run maintain_tables                        # weekly Delta maintenance; --params optimize_full=true re-clusters, vacuum=run really deletes
+.venv/bin/python scripts/measure_pruning.py "<query>"        # files read vs pruned, from query history (reports if it came from cache)
 databricks jobs list-runs --job-id <id> --limit 3            # the run's `trigger` field shows TABLE / PERIODIC / ONE_TIME
 ```
 
@@ -78,6 +80,7 @@ Layout: notebooks are Databricks source files (`# Databricks notebook source`, `
 - `quality.py`: `gold_checks`, `raise_if_any_failed`
 - `contract.py`: `schema_mismatches`, `raise_if_schema_mismatch`. Every job calls it before writing, because Delta silently accepts a missing nullable column and castable types (verified)
 - `migrations.py`: parsing, run order, pending/drift detection, statement splitting, placeholders, bronze DDL generation
+- `maintenance.py`: `tables_to_maintain` (skips `_tmp_`), `describe_change` (before/after files and size)
 
 New logic goes into `src/medallion/` with tests. `DeltaTable` `MERGE`s and table writes stay in the notebooks, because the tests use plain local Spark without Delta.
 
@@ -94,13 +97,20 @@ Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no
 
 **Tables are code (step 8).**
 - Jobs never create, comment on or redefine tables. They check that the table exists, run `raise_if_schema_mismatch`, then write with `writeTo(...).append()` / `.overwrite(F.lit(True))` or `MERGE`. Never use `saveAsTable`, `overwriteSchema` or `mergeSchema` in jobs.
-- Every published table has DDL in `src/<NN_layer>/ddl/`: `<create|alter|rename|drop>_<layer>_<table>_v<NNN>.sql`, versioned per table, with `${catalog}` / `${bronze_schema}` / `${silver_schema}` / `${gold_schema}` placeholders. Schemas are in `00_bronze/ddl/*_schemas_v<NNN>.sql`.
-- A rename starts the new table's history (`rename_<layer>_<old>_to_<new>_v001.sql`) and runs after the old table's migrations.
+- Every published table has DDL in `src/<NN_layer>/ddl/`: `<layer>_<table>_v<NNN>_<create|alter|rename|drop>.sql`, versioned per table, with `${catalog}` / `${bronze_schema}` / `${silver_schema}` / `${gold_schema}` placeholders. Schemas are in `00_bronze/ddl/schemas_v<NNN>_<verb>.sql`.
+- A rename starts the new table's history (`<layer>_<old>_to_<new>_v001_rename.sql`) and runs after the old table's migrations.
 - **Never edit an applied migration.** Add the next version instead. `apply_ddl` refuses any drift (checksum), a missing file, or a moved file.
 - History lives in `<catalog>.ops.schema_migrations` (migration, version, file, checksum, applied_at), created by the runner itself.
 - Intermediates (DataFrames, temp views, `_tmp_*` tables dropped within a run) never get DDL.
 - Naming convention: bronze `<source_system>_<source_table>`, silver plural `<entity>` + `<entity>_quarantine`, gold `fct_` / `dim_` / `agg_<subject>_<grain>`, and no layer in table names. The full convention, including columns, is in `docs/PLAN.md` step 8.
 - Verify DDL changes against a throwaway catalog first (`CATALOG=x scripts/setup_unity_catalog.sh`, `bundle run apply_ddl --params catalog=x`, compare `information_schema.columns`, then `DROP CATALOG x CASCADE`).
+
+**Layout and maintenance (step 9).**
+- Table properties and clustering are set **in migrations**, never ad hoc: `CLUSTER BY` and `SET TBLPROPERTIES` are DDL.
+- `00_bronze.tpch_orders` is clustered by `o_orderdate`; `nyctaxi_trips` and the two silver tables have `optimizeWrite` + `autoCompact`. No table is partitioned or Z-ordered, deliberately (see `docs/PLAN.md` step 9).
+- These are UC managed tables, so **predictive optimization already runs `OPTIMIZE`** and deletion vectors are on by default. Don't claim the repo fixed a small-file problem; it demonstrates and measures.
+- `maintain_tables` is the only job that runs `OPTIMIZE` / `REORG` / `VACUUM`. `VACUUM` stays on `dry_run` unless asked: it shortens time travel.
+- Measure layout claims with `scripts/measure_pruning.py`. Query history redacts the SQL, so it matches runs by `statement_id`; the result cache must be busted with a varying predicate, not a comment.
 
 ## Working agreements
 

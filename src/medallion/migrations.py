@@ -2,13 +2,13 @@
 
 Migrations live next to the code of the schema they belong to, in `src/<NN_layer>/ddl/`:
 
-    src/00_bronze/ddl/create_schemas_v001.sql
-    src/00_bronze/ddl/create_bronze_trips_v001.sql
-    src/00_bronze/ddl/rename_bronze_trips_to_nyctaxi_trips_v001.sql
-    src/01_silver/ddl/alter_silver_trips_v002.sql
+    src/00_bronze/ddl/schemas_v001_create.sql
+    src/00_bronze/ddl/bronze_trips_v001_create.sql
+    src/00_bronze/ddl/bronze_trips_to_nyctaxi_trips_v001_rename.sql
+    src/01_silver/ddl/silver_trips_v002_alter.sql
 
-Each table (and `schemas`) has its own version sequence, starting at v001. A table's history starts with `create` or
-with a `rename_<layer>_<old>_to_<new>` that carries it over from another table.
+Each table (and `schemas`) has its own version sequence, starting at v001. A table's history starts with a `create` or
+with a `<layer>_<old>_to_<new>_v001_rename` that carries it over from another table.
 
 The runner itself (src/ops/apply_ddl.py) only executes SQL and records history. Everything that decides *what* runs
 and in which order lives here, free of Spark, so it can be unit-tested.
@@ -24,9 +24,10 @@ from pathlib import Path
 SRC_DIR = Path(__file__).resolve().parents[1]
 
 LAYER_FOLDER = re.compile(r"^(?P<order>\d{2})_(?P<layer>bronze|silver|gold)$")
-# <verb>_<layer>_<table>_v<NNN>.sql or <verb>_schemas_v<NNN>.sql (see the naming convention in docs/PLAN.md).
+# <layer>_<table>_v<NNN>_<verb>.sql or schemas_v<NNN>_<verb>.sql (see the naming convention in docs/PLAN.md):
+# the subject first, so a table's files sort together, then its version, then what that version does.
 FILE_NAME = re.compile(
-    r"^(?P<verb>create|alter|rename|drop)_(?:(?P<schemas>schemas)|(?P<layer>bronze|silver|gold)_(?P<table>[a-z][a-z0-9_]*?))_v(?P<version>\d{3})\.sql$"
+    r"^(?:(?P<schemas>schemas)|(?P<layer>bronze|silver|gold)_(?P<table>[a-z][a-z0-9_]*?))_v(?P<version>\d{3})_(?P<verb>create|alter|rename|drop)\.sql$"
 )
 PLACEHOLDER = re.compile(r"\$\{([a-z_]+)\}")
 PLACEHOLDERS = ("catalog", "bronze_schema", "silver_schema", "gold_schema")
@@ -41,7 +42,7 @@ class Migration:
     key: str  # what the migration versions: "schemas" or "<layer>_<table>", e.g. "bronze_nyctaxi_trips"
     version: int
     verb: str
-    path: str  # relative to src/, e.g. "00_bronze/ddl/create_bronze_trips_v001.sql"
+    path: str  # relative to src/, e.g. "00_bronze/ddl/bronze_trips_v001_create.sql"
     sql: str
     folder_order: int
     renamed_from: str | None = None  # for a rename: the key of the table it carries over
@@ -67,7 +68,7 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
             continue
         name = FILE_NAME.match(parts[2])
         if not name:
-            problems.append(f"{path}: must be named <create|alter|rename|drop>_<layer>_<table>_v<NNN>.sql or <verb>_schemas_v<NNN>.sql")
+            problems.append(f"{path}: must be named <layer>_<table>_v<NNN>_<create|alter|rename|drop>.sql or schemas_v<NNN>_<verb>.sql")
             continue
         version, verb = int(name["version"]), name["verb"]
         if name["schemas"]:
@@ -80,7 +81,7 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
             if verb == "rename":
                 old_new = name["table"].split("_to_")
                 if len(old_new) != 2 or not all(old_new) or old_new[0] == old_new[1]:
-                    problems.append(f"{path}: a rename must be named rename_<layer>_<old>_to_<new>_v001.sql")
+                    problems.append(f"{path}: a rename must be named <layer>_<old>_to_<new>_v001_rename.sql")
                     continue
                 key, renamed_from = f"{name['layer']}_{old_new[1]}", f"{name['layer']}_{old_new[0]}"
         # A history starts with create (or a rename carrying another table over), so neither can come later.
@@ -208,4 +209,4 @@ def render_bronze_migration(target: str, source_table: str, mode: str, columns: 
         + "\n)\n"
         f"COMMENT 'Raw {source_table}, loaded in {mode} mode, one _batch_id per load';\n"
     )
-    return f"00_bronze/ddl/create_bronze_{target}_v001.sql", sql
+    return f"00_bronze/ddl/bronze_{target}_v001_create.sql", sql

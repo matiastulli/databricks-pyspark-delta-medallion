@@ -1,0 +1,38 @@
+resources:
+  jobs:
+    maintain_tables:
+      name: maintain_tables
+      description: Weekly Delta maintenance for every published table (OPTIMIZE, optional REORG PURGE, VACUUM dry run)
+      tags:
+        layer: ops
+
+      # Weekly, because there is nothing to compact daily at this size. Paused in the dev target like every schedule.
+      schedule:
+        quartz_cron_expression: "0 0 7 ? * SUN"
+        timezone_id: UTC
+
+      max_concurrent_runs: 1
+
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: bronze_schema
+          default: ${var.bronze_schema}
+        - name: silver_schema
+          default: ${var.silver_schema}
+        - name: gold_schema
+          default: ${var.gold_schema}
+        # OPTIMIZE FULL re-clusters existing data: needed once after a new CLUSTER BY, wasteful every week.
+        - name: optimize_full
+          default: "false"
+        # REORG ... APPLY (PURGE) rewrites files to materialize deletion vectors.
+        - name: purge_deletion_vectors
+          default: "false"
+        # VACUUM shortens time travel, so the weekly run only reports what it would delete.
+        - name: vacuum
+          default: "dry_run"
+
+      tasks:
+        - task_key: maintain_tables
+          notebook_task:
+            notebook_path: ../src/ops/maintain_tables.py

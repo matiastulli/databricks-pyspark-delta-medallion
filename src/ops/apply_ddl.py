@@ -4,8 +4,8 @@
 # MAGIC
 # MAGIC Tables are created and changed only here, never by the jobs that write to them. This notebook applies the
 # MAGIC write-once SQL files in `src/<NN_layer>/ddl/` that haven't run yet and records each one in
-# MAGIC `<catalog>.ops.schema_migrations`. Every table has its own version sequence (`create_silver_trips_v001.sql`,
-# MAGIC `alter_silver_trips_v002.sql`, …).
+# MAGIC `<catalog>.ops.schema_migrations`. Every table has its own version sequence (`silver_trips_v001_create.sql`,
+# MAGIC `silver_trips_v002_alter.sql`, …).
 # MAGIC
 # MAGIC **Run order:** `schemas` first, then layer folders (00, 01, 02), tables by name, each table's versions ascending,
 # MAGIC and a renamed table always after the table it renames.

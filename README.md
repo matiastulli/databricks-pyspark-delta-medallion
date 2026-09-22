@@ -45,6 +45,7 @@ flowchart LR
 | Bronze | `src/00_bronze/` | `medallion.00_bronze` | Sources copied as is, plus `_batch_id`, `_ingested_at`, `_source_table`, `_source_file` |
 | Silver | `src/01_silver/` | `medallion.01_silver` | `trips`: deduplicated, validated, typed; `trips_quarantine`: rejected trips with their reasons |
 | Gold | `src/02_gold/` | `medallion.02_gold` | `agg_trips_daily`, `agg_trips_by_pickup_zip`: the trip scorecard |
+| Ops | `src/ops/` | `medallion.ops` | `apply_ddl` applies DDL migrations and records them in `schema_migrations`; `maintain_tables` runs the weekly `OPTIMIZE` / `VACUUM` |
 
 ## What this project shows
 
@@ -59,11 +60,17 @@ flowchart LR
 - **Compute → check → write:** gold runs 13 checks on the new aggregates before publishing: silver's contract, one row per key, and **reconciliation** of trips and revenue with silver. Any failure raises `DataQualityError` listing every failed check, and gold keeps its last good version.
 
 **Tables as code: DDL migrations**
-- **Jobs never create tables.** Every published table is defined by write-once SQL in its schema's folder, e.g. `src/01_silver/ddl/create_silver_trips_v001.sql`, then `alter_silver_trips_v002.sql`. Versions are counted per table, and the `apply_ddl` workflow applies the pending ones and records them in `ops.schema_migrations`.
+- **Jobs never create tables.** Every published table is defined by write-once SQL in its schema's folder, e.g. `src/01_silver/ddl/silver_trips_v001_create.sql`, then `silver_trips_v002_alter.sql`. Versions are counted per table, and the `apply_ddl` workflow applies the pending ones and records them in `ops.schema_migrations`.
 - **A small in-repo runner** ([`migrations.py`](src/medallion/migrations.py), unit-tested): schemas first, then layer folders, tables and versions, with renames after the table they rename. It refuses an applied migration that was edited or deleted, and misplaced, misnamed, duplicate or missing versions.
 - **Adopted without rewriting anything:** the baseline migrations reproduce the 12 existing tables exactly (117 columns: types, `NOT NULL`, comments; checked against a fresh catalog). Applying them left every table's Delta version and row count unchanged.
 - **A naming convention, applied through migrations:** bronze `<source_system>_<source_table>` (derived from the config), silver plural entities, gold `fct_` / `dim_` / `agg_<subject>_<grain>`. Three tables were renamed with `ALTER TABLE … RENAME TO`, and their data, history and comments moved with them.
 - **A write contract:** before writing, every job checks that its DataFrame matches the table's columns and types exactly. Delta rejects extra columns, `NOT NULL` violations and impossible casts, but on Databricks it silently accepted a missing nullable column (filled with null), so the jobs check first.
+
+**Delta layout and maintenance, measured**
+- **Liquid clustering:** `00_bronze.tpch_orders` is `CLUSTER BY (o_orderdate)`, set in a migration. Measured with [`scripts/measure_pruning.py`](scripts/measure_pruning.py): a date filter went from reading **3 of 3 files (nothing pruned)** to **1 of 2 files, 35.7 MB pruned**. On a 165 MB table that saves under a second; the point is the mechanism and the measurement.
+- **Optimized writes and auto compaction** on the tables written every run, with each migration explaining that one acts before the write and the other after the commit.
+- **A weekly [`maintain_tables`](resources/maintain_tables_job.yml) workflow:** `OPTIMIZE` (the only operation that re-clusters), optional `REORG TABLE … APPLY (PURGE)` to materialize deletion vectors, and `VACUUM` in dry run by default, since it shortens time travel. It reports files, size and clustering before and after.
+- **What Databricks already does here:** these are Unity Catalog managed tables, so deletion vectors are on by default and **predictive optimization already runs `OPTIMIZE`** (241k rows sat in one file before this step). No partitioning and no Z-order: both are the wrong tool at this size, and Z-order can't coexist with liquid clustering.
 
 **Databricks workflows as code** ([`databricks.yml`](databricks.yml), [`resources/`](resources))
 - **One workflow per process:** eight `ingest_<source>` jobs (daily, twice a month, monthly), `clean_trips` (silver) and `build_trip_metrics` (the gold scorecard).
@@ -73,7 +80,7 @@ flowchart LR
 
 **Tests and CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml))
 - **Thin notebooks, tested logic:** all transformations live in [`src/medallion/`](src/medallion) as pure DataFrame functions. The notebooks only read, call, write and orchestrate.
-- **46 pytest tests** on local PySpark, with no workspace: key stability, first load wins, the silver/quarantine split, typing, aggregates, quality checks, edge cases (nulls, empty inputs), the write contract, the migration runner (order, drift, naming), and validation of the sources config. One edge-case test caught a real bug: a trip with a null value passed validation, because `null <= 0` is null, not true.
+- **49 pytest tests** on local PySpark, with no workspace: key stability, first load wins, the silver/quarantine split, typing, aggregates, quality checks, edge cases (nulls, empty inputs), the write contract, the migration runner (order, drift, naming), and validation of the sources config. One edge-case test caught a real bug: a trip with a null value passed validation, because `null <= 0` is null, not true.
 - **CI on GitHub, CD from the laptop:** every push runs the tests. Deploys are `databricks bundle deploy` with OAuth, so GitHub holds no Databricks credentials.
 
 ## Project structure
@@ -84,24 +91,28 @@ flowchart LR
 ├── resources/
 │   ├── __init__.py               generates one ingest_<source> job per config entry
 │   ├── apply_ddl_job.yml         applies pending DDL migrations
+│   ├── maintain_tables_job.yml   weekly Delta maintenance
 │   ├── clean_trips_job.yml       silver workflow (table update trigger)
 │   └── build_trip_metrics_job.yml  gold scorecard workflow (table update trigger)
 ├── src/
 │   ├── 00_bronze/
 │   │   ├── ingest.py             one generic notebook for every source
-│   │   └── ddl/                  create_schemas_v001.sql, create_bronze_<table>_v001.sql, rename_…_v001.sql
+│   │   └── ddl/                  schemas_v001_create.sql, bronze_<table>_v001_create.sql, …_v001_rename.sql
 │   ├── 01_silver/
 │   │   ├── clean_trips.py
-│   │   └── ddl/                  create_silver_trips_v001.sql, …
+│   │   └── ddl/                  silver_trips_v001_create.sql, …
 │   ├── 02_gold/
 │   │   ├── build_trip_metrics.py
-│   │   └── ddl/                  create_gold_…_v001.sql, rename_…_to_agg_…_v001.sql
-│   ├── ops/apply_ddl.py          the migration runner
-│   └── medallion/                sources, bronze, silver, gold, quality, contract, migrations: the tested logic
+│   │   └── ddl/                  gold_…_v001_create.sql, …_to_agg_…_v001_rename.sql
+│   ├── ops/
+│   │   ├── apply_ddl.py          the migration runner
+│   │   └── maintain_tables.py    OPTIMIZE / REORG / VACUUM, weekly
+│   └── medallion/                sources, bronze, silver, gold, quality, contract, migrations, maintenance: the tested logic
 ├── tests/                        pytest on local PySpark
 ├── scripts/
 │   ├── setup_unity_catalog.sh    the catalog (one-off)
-│   └── new_bronze_migration.py   generates a bronze table's DDL from its source schema
+│   ├── new_bronze_migration.py   generates a bronze table's DDL from its source schema
+│   └── measure_pruning.py        files read vs pruned for a query
 ├── docs/PLAN.md                  the learning path, decisions and verifications
 ├── .github/workflows/ci.yml
 ├── databricks.yml · pyproject.toml
@@ -170,7 +181,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)               # only needed for
 ### Add a bronze table
 
 1. Add a `[[sources]]` entry to [`config/sources.toml`](config/sources.toml): `table`, `mode` (`append` / `overwrite`), `schedule` (Quartz cron, UTC). The bronze table and job names are derived: `samples.tpch.lineitem` → `tpch_lineitem`, `ingest_tpch_lineitem`.
-2. `.venv/bin/python scripts/new_bronze_migration.py tpch_lineitem`: writes `src/00_bronze/ddl/create_bronze_tpch_lineitem_v001.sql` from the source's real schema. Review it.
+2. `.venv/bin/python scripts/new_bronze_migration.py tpch_lineitem`: writes `src/00_bronze/ddl/bronze_tpch_lineitem_v001_create.sql` from the source's real schema. Review it.
 3. `.venv/bin/pytest tests/test_sources.py tests/test_migrations.py`: the config and the migrations must pass validation (CI checks them too).
 4. `databricks bundle deploy`, then `databricks bundle run apply_ddl` to create the table, then run `ingest_<name>`.
 
@@ -180,9 +191,11 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)               # only needed for
 |---|---|
 | `databricks bundle run apply_ddl --params dry_run=true` | List pending migrations without executing them |
 | `databricks bundle run apply_ddl` | Apply pending migrations in order and record them in `ops.schema_migrations`; a rerun does nothing |
-| `.venv/bin/python scripts/new_bronze_migration.py <name>` | Generate a bronze table's `create_…_v001.sql` from its source schema (`--dry-run` prints it) |
+| `databricks bundle run maintain_tables` | `OPTIMIZE` + `VACUUM` dry run over every table; `--params optimize_full=true` re-clusters, `vacuum=run` really deletes |
+| `.venv/bin/python scripts/measure_pruning.py "<query>"` | Files read vs pruned for a query, from query history |
+| `.venv/bin/python scripts/new_bronze_migration.py <name>` | Generate a bronze table's `…_v001_create.sql` from its source schema (`--dry-run` prints it) |
 
-Change a table by adding its next version, e.g. `src/02_gold/ddl/alter_gold_agg_trips_daily_v002.sql`. **Never edit an applied migration:** the runner refuses to continue until the file matches what ran.
+Change a table by adding its next version, e.g. `src/02_gold/ddl/gold_agg_trips_daily_v002_alter.sql`. **Never edit an applied migration:** the runner refuses to continue until the file matches what ran.
 
 ### Jobs and runs
 
@@ -221,7 +234,7 @@ Useful in the SQL editor: `DESCRIBE HISTORY medallion.01_silver.trips` (what eac
 ## Tests
 
 ```sh
-.venv/bin/pytest                                     # all 46 tests, ~7 s
+.venv/bin/pytest                                     # all 49 tests, ~7 s
 .venv/bin/pytest tests/test_silver.py                # one file
 .venv/bin/pytest -k time_zone                        # by name
 ```
