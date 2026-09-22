@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** ✅ all steps done
+**Status:** steps 0–8 done · next up: **step 9, Delta table layout and maintenance**
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -15,6 +15,9 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 6. Scale out | ✅ Done | Generic ingestion driven by `config/sources.toml`, one scheduled job per source, and silver/gold jobs triggered by table updates |
 | 7. Complete tests | ✅ Done | The rest of the transformations as pure functions, with full pytest coverage |
 | 8. DDL as migrations | ✅ Done | Tables created and changed only by versioned SQL migrations applied by an `apply_ddl` workflow; jobs stop creating tables |
+| 9. Layout + maintenance | ⏳ Next | Liquid clustering and Delta table properties through migrations, plus a `maintain_tables` workflow (`OPTIMIZE`, `REORG`, `VACUUM`), measured |
+| 10. Auto Loader | 🔜 Planned | File ingestion from a UC volume with Auto Loader, `availableNow` and a checkpoint |
+| 11. Change Data Feed | 🔜 Planned | An incremental gold built from silver's change feed instead of a full rebuild |
 
 ## Constraints that shape every step
 
@@ -382,6 +385,63 @@ Built and verified on the workspace:
   - **Learned:** a table update trigger needs time after it's unpaused before it notices writes. In the first attempt the write committed about 25 seconds after unpausing, and nothing fired within 9 minutes. When testing triggers, unpause, wait a couple of minutes, then write.
 
 Note: **least privilege** can only be documented here, not demonstrated. Free Edition has a single user, so the jobs and the migration runner run as the same identity.
+
+## 9. Delta table layout and maintenance ⏳
+
+**Goal:** put the Delta layout and maintenance levers from [`docs/databricks.md`](databricks.md) into practice, and **measure** them, rather than repeating the theory.
+
+**What the workspace already does for us** (checked 2026-09-22, before planning this step):
+- **Deletion vectors are on everywhere** (`delta.enableDeletionVectors = true`), the Databricks default. So merge-on-read is already in play, and materializing the vectors is a maintenance question, not a setting to turn on.
+- **Predictive optimization is already compacting.** `00_bronze.nyctaxi_trips` holds 241,252 rows in **1 file** (0.6 MB), and `DESCRIBE HISTORY` shows an `OPTIMIZE` run by a service principal, not by us. The catalog and schema both report `enable_predictive_optimization: INHERIT`.
+- **No table is clustered or partitioned** (`clusteringColumns` is empty everywhere).
+- Sizes today: `tpch_orders` 7.5M rows / 165 MB / 3 files; everything else is 1–2 files and under 2 MB.
+
+**So the small-file problem doesn't exist here.** Anything this step adds is to show the mechanism and measure it honestly, not to fix a real pain. The plan says so, and the README should too.
+
+Planned:
+- **Table properties through migrations** (`alter_<layer>_<table>_v<NNN>.sql`), so the DDL stays the source of truth: `delta.autoOptimize.optimizeWrite` and `delta.autoOptimize.autoCompact` on the tables that get frequent small writes (bronze `nyctaxi_trips`, silver `trips` and `trips_quarantine`), with a comment in the migration saying what each one does and when it acts (before the write vs after the commit).
+- **Liquid clustering on the one table big enough to show it:** `ALTER TABLE 00_bronze.tpch_orders CLUSTER BY (o_orderdate)`, then `OPTIMIZE` to cluster the existing data.
+  - **Measured, not assumed:** run the same `WHERE o_orderdate = …` query before and after, and compare the files read from the query history metrics (`/api/2.0/sql/history/queries`). Record the numbers here, including if the difference turns out to be nothing at this size.
+  - Liquid clustering can't be combined with partitioning or `ZORDER`, so this table picks one and keeps it.
+- **A `maintain_tables` workflow** (`src/ops/maintain_tables.py`, weekly, paused in dev like everything else):
+  - `DESCRIBE DETAIL` before and after, reporting files, size and clustering per table
+  - `OPTIMIZE` each table (the only operation that re-clusters; auto compaction only glues files together)
+  - `REORG TABLE … APPLY (PURGE)` to materialize deletion vectors
+  - `VACUUM … DRY RUN` first, with the real `VACUUM` behind a parameter, and retention left at the 7-day default
+  - It returns a JSON summary like the other jobs, so a run shows what changed
+- **Document what we didn't do and why:** no partitioning (Databricks says not under ~1 TB), and predictive optimization already runs `OPTIMIZE`, so our scheduled job is partly a demonstration.
+
+**Out of scope, with reasons:**
+- **Z-order:** left out. It can't coexist with liquid clustering on the same table, and adding a table only to demo the legacy approach is noise. `docs/databricks.md` §3 already explains it, including why liquid clustering replaced it. (The user can pull it back in, on a table of its own.)
+- **Partitioning:** the tables are orders of magnitude below the threshold where it helps.
+
+**Verified on Free Edition before building** (2026-09-22, on a throwaway `_tmp_` table that was dropped afterwards):
+- `ALTER TABLE … CLUSTER BY (o_orderdate)` works on a UC managed table, and `DESCRIBE DETAIL` reports the clustering columns
+- `OPTIMIZE`, `OPTIMIZE … FULL`, `REORG TABLE … APPLY (PURGE)` and `VACUUM … DRY RUN` all work on serverless
+- Query history reports pruning: `pruned_files_count`, `read_files_count`, `pruned_bytes`, `rows_read_count`, via **GET** `/api/2.0/sql/history/queries?include_metrics=true` (the POST form doesn't exist in this CLI). So the clustering effect can be measured rather than asserted.
+- `DESCRIBE DETAIL` can't be used as a subquery the way `DESCRIBE HISTORY` can; run it on its own and read the columns.
+
+## 10. File ingestion: Auto Loader and checkpoints 🔜
+
+**Goal:** close the biggest gap against [`docs/databricks.md`](databricks.md) §5. Bronze currently reads *tables*, so nothing here uses Auto Loader, Structured Streaming, triggers or checkpoints.
+
+Planned:
+- Land sample files in a Unity Catalog volume (export a slice of the trips sample), so there's a real file source
+- A bronze process reading them with Auto Loader (`cloudFiles`), `trigger(availableNow=True)` and its own checkpoint, writing the same bronze table shape
+- Show the checkpoint's `offsets/` / `commits/` / `sources/` contents, and that a rerun ingests nothing new
+- Show what happens when new files land, and what deleting the checkpoint would do (described, not done to the real table)
+- `maxFilesPerTrigger` to cap a backlog
+- Keep the table-based ingestion for the other sources: the config gets a source *kind*
+
+## 11. Change Data Feed: an incremental gold 🔜
+
+**Goal:** replace gold's full rebuild with incremental processing, the last big idea in [`docs/databricks.md`](databricks.md) §2 that this project doesn't use.
+
+Planned:
+- `delta.enableChangeDataFeed` on `01_silver.trips` through a migration
+- A gold process reading `table_changes(...)` since the last processed version instead of re-aggregating everything
+- Keep the reconciliation checks, which are exactly what catches an incremental aggregation that drifts from its source
+- Track the last processed version in an `ops` table, next to the migration history
 
 ---
 

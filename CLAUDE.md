@@ -18,6 +18,10 @@ Learning path. `docs/PLAN.md` is the only place that tracks it: update its statu
 6. Scale out: generic `00_bronze/ingest.py` driven by `config/sources.toml` (nyctaxi + TPC-H), one generated, scheduled job per source, and silver/gold jobs on table update triggers; `src/` folders per schema, notebooks named by process
 7. Complete tests: the remaining transformations and edge cases
 8. Table DDL as versioned migrations (`src/<NN_layer>/ddl/<verb>_<layer>_<table>_v<NNN>.sql`, versioned per table; renames `rename_<layer>_<old>_to_<new>_v001.sql`; applied by the `apply_ddl` workflow), so jobs stop creating tables. **DDL holds only final (published) tables.** Intermediates inside one transformation (DataFrames, temp views, CTEs, or a `_tmp_` table created and dropped within a run) never go in the `ddl/` folders. In-repo migration runner; schemas created by a migration (not the bundle `schema` resource: dev mode renames it to `dev_<user>_<name>` and `bundle destroy` drops it with its data, tested). Table naming convention in `docs/PLAN.md` step 8: bronze `<source_system>_<source_table>`, silver plural `<entity>` + `<entity>_quarantine`, gold `fct_`/`dim_`/`agg_<subject>_<grain>`, temp `_tmp_<process>_<purpose>`, no layer in table names. Done
+9. Delta layout + maintenance: liquid clustering and table properties (`optimizeWrite`, `autoCompact`) through migrations, and a `maintain_tables` workflow (`OPTIMIZE`, `REORG … APPLY (PURGE)`, `VACUUM`), with before/after measurements. Z-order and partitioning are deliberately out (see `docs/PLAN.md` step 9). Note: deletion vectors are on by default and **predictive optimization already runs `OPTIMIZE`** on these tables, so this step demonstrates and measures rather than fixes
+10. Auto Loader: file ingestion from a UC volume with `availableNow` and a checkpoint
+11. Change Data Feed: an incremental gold from silver's change feed
+
 
 ## Environment
 
