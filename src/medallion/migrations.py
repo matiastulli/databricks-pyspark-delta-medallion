@@ -1,23 +1,27 @@
-"""Table DDL as write-once SQL migrations, one folder per table, applied by a small in-repo runner.
+"""Table DDL as write-once SQL migrations, next to the process that writes the table, applied by a small in-repo runner.
 
-Migrations live next to the code of the schema they belong to, one folder per table. Two folders aren't layers:
-`src/catalog/ddl/schemas/` creates the layer schemas and runs first, and `src/ops/ddl/` holds tooling tables and runs last:
+Every folder under a layer holds one process and the DDL of the tables it writes; the table is in the file name, because a
+folder can hold several tables. Folders starting with `_` hold generic code that serves every table (e.g. bronze's
+`_ingestion/`) and never DDL. Two top-level folders aren't layers: `src/catalog/schemas/` creates the layer schemas and
+runs first, and `src/ops/` holds tooling tables and runs last:
 
-    src/catalog/ddl/schemas/v001_create.sql
-    src/00_bronze/ddl/nyctaxi_trips/v001_create.sql
-                                   /v002_rename.sql   ALTER TABLE trips RENAME TO nyctaxi_trips
-                                   /v003_alter.sql
-    src/01_silver/ddl/trips/v001_create.sql
+    src/catalog/schemas/ddl_schemas_v001_create.sql
+    src/00_bronze/nyctaxi_trips/ddl_nyctaxi_trips_v001_create.sql
+                               /ddl_nyctaxi_trips_v002_rename.sql   ALTER TABLE trips RENAME TO nyctaxi_trips
+                               /ddl_nyctaxi_trips_v003_alter.sql
+    src/01_silver/trips/ddl_trips_v001_create.sql
+                       /ddl_trips_quarantine_v001_create.sql
+                       /notebook_clean_trips.py
 
-The folder is the table as it is called **now**, so its whole history is in one place and reads in version order. A
-rename is just another version of that table, not a new identity.
+The file name carries the table as it is called **now**, so a renamed table's whole history reads in version order under
+one name, and all of a table's versions must live in one folder. A rename is just another version of that table.
 
-**A migration is identified by the SHA-256 of its content, not by its path.** Renaming a table moves and renumbers its
+**A migration is identified by the SHA-256 of its content, not by its path.** Renaming a table moves and renames its
 files, and that must not look like a different migration. Editing an applied migration still fails, and so does
 deleting one: those are what write-once protects.
 
-The runner itself (src/ops/notebooks/apply_ddl.py) only executes SQL and records history. Everything that decides *what* runs
-and in which order lives here, free of Spark, so it can be unit-tested.
+The runner itself (src/ops/schema_migrations/notebook_apply_ddl.py) only executes SQL and records history. Everything
+that decides *what* runs and in which order lives here, free of Spark, so it can be unit-tested.
 """
 
 import hashlib
@@ -31,8 +35,9 @@ SRC_DIR = Path(__file__).resolve().parents[1]
 # A layer folder (00_bronze …), `catalog`, which creates the layer schemas and runs first, or `ops`, which holds tooling
 # tables and runs last, after the layers it supports.
 LAYER_FOLDER = re.compile(r"^(?:(?P<order>\d{2})_(?P<layer>bronze|silver|gold)|(?P<catalog>catalog)|(?P<ops>ops))$")
-TABLE_FOLDER = re.compile(r"^[a-z][a-z0-9_]*$")
-FILE_NAME = re.compile(r"^v(?P<version>\d{3})_(?P<verb>create|alter|rename|drop)\.sql$")
+# A process folder (`trips`), or a generic one (`_ingestion`) that serves every table and holds no DDL.
+PROCESS_FOLDER = re.compile(r"^(?P<generic>_)?[a-z][a-z0-9_]*$")
+FILE_NAME = re.compile(r"^ddl_(?P<table>[a-z][a-z0-9_]*)_v(?P<version>\d{3})_(?P<verb>create|alter|rename|drop)\.sql$")
 PLACEHOLDER = re.compile(r"\$\{([a-z_]+)\}")
 PLACEHOLDERS = ("catalog", "bronze_schema", "silver_schema", "gold_schema")
 
@@ -48,7 +53,7 @@ class Migration:
     key: str  # what the migration versions: "schemas" or "<layer>_<table>", e.g. "bronze_nyctaxi_trips"
     version: int
     verb: str
-    path: str  # relative to src/, e.g. "00_bronze/ddl/nyctaxi_trips/v002_rename.sql"
+    path: str  # relative to src/, e.g. "00_bronze/nyctaxi_trips/ddl_nyctaxi_trips_v002_rename.sql"
     sql: str
     folder_order: int
 
@@ -67,22 +72,26 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
     problems, migrations = [], []
     for path, sql in sorted(files.items()):
         parts = Path(path).parts
-        folder = LAYER_FOLDER.match(parts[0]) if len(parts) == 4 and parts[1] == "ddl" else None
+        folder = LAYER_FOLDER.match(parts[0]) if len(parts) == 3 else None
         if not folder:
-            problems.append(f"{path}: must be src/<NN_layer, catalog or ops>/ddl/<table>/<file>, e.g. 00_bronze/ddl/nyctaxi_trips/v001_create.sql")
+            problems.append(f"{path}: must be src/<NN_layer, catalog or ops>/<folder>/<file>, e.g. 01_silver/trips/ddl_trips_v001_create.sql")
             continue
-        table = parts[2]
-        if not TABLE_FOLDER.match(table):
-            problems.append(f"{path}: the folder {table!r} must be the table name in lowercase letters, digits and underscores")
+        process = PROCESS_FOLDER.match(parts[1])
+        if not process:
+            problems.append(f"{path}: the folder {parts[1]!r} must be lowercase letters, digits and underscores")
             continue
-        name = FILE_NAME.match(parts[3])
+        if process["generic"]:
+            problems.append(f"{path}: {parts[1]}/ holds generic code; put the DDL in the folder of the process that writes the table")
+            continue
+        name = FILE_NAME.match(parts[2])
         if not name:
-            problems.append(f"{path}: must be named v<NNN>_<create|alter|rename|drop>.sql")
+            problems.append(f"{path}: must be named ddl_<table>_v<NNN>_<create|alter|rename|drop>.sql")
             continue
+        table = name["table"]
 
         # The schemas are the catalog's only DDL, and the only migration whose key isn't <layer>_<table>.
         if (table == SCHEMAS) != bool(folder["catalog"]):
-            problems.append(f"{path}: the schemas live in catalog/ddl/schemas/, and catalog/ holds nothing else")
+            problems.append(f"{path}: the schemas live in catalog/schemas/, and catalog/ holds nothing else")
             continue
 
         version, verb = int(name["version"]), name["verb"]
@@ -105,6 +114,9 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
             problems.append(f"{key}: versions {['v%03d' % n for n in duplicates]} are used by more than one file")
         if missing := sorted(set(range(1, max(numbers) + 1)) - set(numbers)):
             problems.append(f"{key}: missing versions {['v%03d' % n for n in missing]}")
+        # One table, one folder: its history must read in one place.
+        if len(folders := sorted({str(Path(m.path).parent) for m in versions})) > 1:
+            problems.append(f"{key}: versions are split across {folders}; keep a table's history in one folder")
 
     if problems:
         raise ValueError("invalid migrations:\n  " + "\n  ".join(problems))
@@ -112,7 +124,7 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
 
 
 def load_migrations(src_dir: Path = SRC_DIR) -> list[Migration]:
-    return parse_migrations({path.relative_to(src_dir).as_posix(): path.read_text(encoding="utf-8") for path in sorted(src_dir.glob("*/ddl/*/*.sql"))})
+    return parse_migrations({path.relative_to(src_dir).as_posix(): path.read_text(encoding="utf-8") for path in sorted(src_dir.glob("*/*/*.sql"))})
 
 
 def pending_migrations(migrations: list[Migration], applied: dict[str, tuple[str, int, str]]) -> list[Migration]:
@@ -133,7 +145,7 @@ def pending_migrations(migrations: list[Migration], applied: dict[str, tuple[str
         else:
             problems.append(f"{path} was applied but is gone: no file has its content, and {key} v{version:03d} no longer exists")
     if problems:
-        raise ValueError("migration history doesn't match the ddl/ folders:\n  " + "\n  ".join(problems))
+        raise ValueError("migration history doesn't match the ddl_ files:\n  " + "\n  ".join(problems))
     return [m for m in migrations if m.checksum not in applied]
 
 
@@ -193,4 +205,4 @@ def render_bronze_migration(target: str, source_table: str, mode: str, columns: 
         + "\n)\n"
         f"COMMENT 'Raw {source_table}, loaded in {mode} mode, one _batch_id per load';\n"
     )
-    return f"00_bronze/ddl/{target}/v001_create.sql", sql
+    return f"00_bronze/{target}/ddl_{target}_v001_create.sql", sql

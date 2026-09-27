@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** ✅ all steps done (0–13)
+**Status:** ✅ all steps done (0–14)
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -19,7 +19,8 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 10. Auto Loader | ✅ Done | File ingestion from a UC volume with Auto Loader, `availableNow` and a checkpoint |
 | 11. Change Data Feed | ✅ Done | An incremental gold built from silver's change feed instead of a full rebuild |
 | 12. DDL folder per table | ✅ Done | A table's whole history in one folder named after it, with migrations identified by checksum instead of path |
-| 13. Folders say what they hold | ✅ Done | Notebooks in a `notebooks/` folder next to `ddl/` in every `src/` folder, and the demo helper out of bronze into `src/tools/` |
+| 13. Folders say what they hold | ✅ Done | Notebooks in a `notebooks/` folder next to `ddl/` in every `src/` folder, and the demo helper out of bronze into `src/tools/` (layout superseded by step 14) |
+| 14. Folders by process | ✅ Done | One folder per process holding its notebook and the DDL of the tables it writes, generic code in `_` folders, the same layout as the AWS sibling repo |
 
 ## Constraints that shape every step
 
@@ -551,6 +552,8 @@ Verified on the workspace:
 
 ## 13. Folders say what they hold ✅
 
+> Superseded by step 14: the `notebooks/` / `ddl/` split is gone. Kept as the record of the decision.
+
 **Goal:** tell at a glance what a file is. Until now a layer folder mixed notebooks (`ingest.py`) with the `ddl/` folder, and `seed_landing_files.py` sat in bronze although it's a demo helper, not part of the pipeline.
 
 **Decisions (the user's):**
@@ -569,6 +572,45 @@ Verified on the workspace:
 - The `../..` import cell resolves on serverless: `apply_ddl` (dry run: 25 applied, 0 moved, 0 pending, so the runner still finds every migration), `ingest_landing_trips` (0 rows, the checkpoint is untouched), `clean_trips` (0 inserted), `build_trip_metrics` (incremental, 0 dates rebuilt, 13/13 checks) all succeeded
 - Not rerun, to save quota: `ingest_nyctaxi_trips` (same notebook folder and import cell as `ingest_files.py`, and a run appends a full batch), `maintain_tables` (same import cell as `apply_ddl`), `seed_landing_files` (imports nothing; `bundle validate` shows its new path)
 - 62 tests pass
+
+## 14. Folders by process ✅
+
+**Goal:** lay `src/` out like the sibling repo [aws-terraform-glue-iceberg-medallion](https://github.com/matiastulli/aws-terraform-glue-iceberg-medallion), so both portfolio repos read the same way. A folder is a process: its notebook and the DDL of every table it writes sit together, so who owns a table is visible from the tree.
+
+**Decisions (the user's):**
+- **Adopt the layout in full**, replacing step 13's split by kind (`notebooks/`, `ddl/`) and step 12's `ddl/<table>/v<NNN>_<verb>.sql`.
+- **File prefixes say what a file is:** `notebook_` for what a job runs (the AWS repo's `glue_job_` / `lambda_`), `ddl_<table>_v<NNN>_<verb>.sql` for a migration.
+- **`_`-prefixed folders hold generic code** that serves every table: `00_bronze/_ingestion/` (both ingestion notebooks), `ops/_maintenance/`.
+- **Folder names:** silver `trips/` (the entity: `trips` + `trips_quarantine`), gold `trip_metrics/` (the process's noun, as `readings/` ↔ `clean_readings` in AWS), bronze one DDL-only folder per table.
+
+```
+src/catalog/schemas/ddl_schemas_v001_create.sql
+src/00_bronze/_ingestion/notebook_ingest.py, notebook_ingest_files.py
+src/00_bronze/nyctaxi_trips/ddl_nyctaxi_trips_v001_create.sql, …_v002_rename.sql, …_v003_alter.sql
+src/01_silver/trips/notebook_clean_trips.py, ddl_trips_v00N_*.sql, ddl_trips_quarantine_v00N_*.sql
+src/02_gold/trip_metrics/notebook_build_trip_metrics.py, ddl_agg_trips_daily_*.sql, ddl_agg_trips_by_pickup_zip_*.sql
+src/ops/schema_migrations/notebook_apply_ddl.py      the runner (it creates its own history table, so no DDL)
+src/ops/processed_versions/ddl_processed_versions_v001_create.sql
+src/ops/_maintenance/notebook_maintain_tables.py
+src/tools/landing/notebook_seed_landing_files.py
+```
+
+**What follows from it:**
+- **The table moves from the folder name into the file name**, because a folder can now hold several tables. The runner reads `src/<layer>/<folder>/ddl_<table>_v<NNN>_<verb>.sql`.
+- **"A table's history in one place" is now a rule, not a consequence of the layout.** The runner refuses a table whose versions are split across folders, and DDL inside a `_` folder.
+- **Keys don't change** (`<layer>_<table>`, `schemas`), and neither do checksums, so the move is free: `apply_ddl` only refreshes the recorded paths, as in step 12.
+- **A rename now renames files**, not just a folder: `ddl_<new>_v00N_*.sql` for every version. Free, because identity is the checksum.
+- Notebooks stay two levels under `src/`, so the `../..` import cell is unchanged. The job names stay the same, and only their `notebook_path` changes.
+- Applied migrations keep their old path comments, and so does the comment on `ops.schema_migrations`, for the same reason as step 13.
+
+**Why not in AWS style everywhere:** bronze has one generic notebook for every table, so its per-table folders hold only DDL. With one process per layer, silver and gold have a single folder each. The layout pays off once a second silver or gold process lands.
+
+Verified on the workspace:
+- `bundle deploy`: 44 files uploaded, 32 deleted (the old notebook and DDL paths), 14 jobs updated
+- `apply_ddl` dry run: **25 already applied, 25 moved, 0 pending**, so every checksum still matched. The real run refreshed the 25 history rows, and a second dry run reported 0 moved, 0 pending.
+- Every moved notebook ran on serverless: `ingest_landing_trips` (0 rows, checkpoint untouched), `ingest_tpch_region` (5 rows, overwrite), `clean_trips` (0 inserted; 21,847 trips, 85 quarantined), `build_trip_metrics` (incremental, 0 dates rebuilt, 13/13 checks) and `maintain_tables` (13 tables, vacuum dry run)
+- Not rerun: `seed_landing_files` (imports nothing; `bundle validate` shows its new path)
+- 66 tests pass, including new ones: DDL in a `_` folder, a table split across folders, two tables in one folder, a file without the `ddl_` prefix
 
 ---
 

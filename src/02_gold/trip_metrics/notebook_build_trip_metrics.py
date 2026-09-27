@@ -21,7 +21,7 @@
 # MAGIC any fails the table is put back with `RESTORE TABLE … TO VERSION AS OF`, then the run fails. Either way a bad
 # MAGIC aggregate never stays published.
 # MAGIC
-# MAGIC The tables themselves are created and changed only by DDL migrations in `src/02_gold/ddl/` (the `apply_ddl` job).
+# MAGIC The tables themselves are created and changed only by the DDL migrations next to this notebook (`ddl_agg_trips_*.sql`), applied by the `apply_ddl` job.
 
 # COMMAND ----------
 

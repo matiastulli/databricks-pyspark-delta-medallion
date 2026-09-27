@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Ingest files into bronze with Auto Loader
 # MAGIC
-# MAGIC The file counterpart of `ingest.py`. The `source` parameter names a `kind = "files"` entry in
+# MAGIC The file counterpart of `notebook_ingest.py`. The `source` parameter names a `kind = "files"` entry in
 # MAGIC `config/sources.toml`, and the job runs this notebook for it.
 # MAGIC
 # MAGIC - **Auto Loader** (`cloudFiles`) tracks which files it has already read, so a run costs only the new ones. No
@@ -37,7 +37,7 @@ from medallion.sources import get_source
 
 catalog, bronze_schema = dbutils.widgets.get("catalog"), dbutils.widgets.get("bronze_schema")
 source = get_source(dbutils.widgets.get("source"))
-assert source.kind == "files", f"{source.name} is a {source.kind} source: use ingest.py"
+assert source.kind == "files", f"{source.name} is a {source.kind} source: use notebook_ingest.py"
 
 landing = f"/Volumes/{catalog}/{bronze_schema}/{source.volume}/{source.path}"
 checkpoint = f"/Volumes/{catalog}/{bronze_schema}/{source.volume}/_checkpoints/{source.name}"

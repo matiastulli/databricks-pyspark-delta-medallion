@@ -64,9 +64,9 @@ flowchart LR
 - Proven by breaking it on purpose: a gold date deleted by hand made reconciliation fail (`got 21475, expected 21833`), the run failed, and gold came back at its pre-run values.
 
 **Tables as code: DDL migrations**
-- **Jobs never create tables.** Every published table has its own folder of write-once SQL, named as the table is called now: `src/01_silver/ddl/trips/v001_create.sql`, `v002_alter.sql`, `v003_alter.sql`. The `apply_ddl` workflow applies the pending ones and records them in `ops.schema_migrations`.
-- **A migration is identified by the checksum of its content, not its path**, so renaming a table (its folder, and the renumbering that follows) re-applies nothing: a rename is just another version inside the folder, and the whole history of a table stays in one place.
-- **A small in-repo runner** ([`migrations.py`](src/medallion/migrations.py), unit-tested): the schemas first (`src/catalog/ddl/schemas/`), then layer folders, tables and versions, with renames after the table they rename. It refuses an applied migration that was edited or deleted, and misplaced, misnamed, duplicate or missing versions.
+- **Jobs never create tables.** Every published table has write-once SQL files next to the process that writes it, named as the table is called now: `src/01_silver/trips/ddl_trips_v001_create.sql`, `ddl_trips_v002_alter.sql`, `ddl_trips_v003_alter.sql`. The `apply_ddl` workflow applies the pending ones and records them in `ops.schema_migrations`.
+- **A migration is identified by the checksum of its content, not its path**, so renaming a table (and its files) re-applies nothing: a rename is just another version, and the whole history of a table stays in one folder.
+- **A small in-repo runner** ([`migrations.py`](src/medallion/migrations.py), unit-tested): the schemas first (`src/catalog/schemas/`), then layer folders, tables and versions. It refuses an applied migration that was edited or deleted, and misplaced, misnamed, duplicate or missing versions, DDL in a generic `_` folder, and a table split across folders.
 - **Adopted without rewriting anything:** the baseline migrations reproduce the 12 existing tables exactly (117 columns: types, `NOT NULL`, comments; checked against a fresh catalog). Applying them left every table's Delta version and row count unchanged.
 - **A naming convention, applied through migrations:** bronze `<source_system>_<source_table>` (derived from the config), silver plural entities, gold `fct_` / `dim_` / `agg_<subject>_<grain>`. Three tables were renamed with `ALTER TABLE … RENAME TO`, and their data, history and comments moved with them.
 - **A write contract:** before writing, every job checks that its DataFrame matches the table's columns and types exactly. Delta rejects extra columns, `NOT NULL` violations and impossible casts, but on Databricks it silently accepted a missing nullable column (filled with null), so the jobs check first.
@@ -114,21 +114,21 @@ flowchart LR
 │   └── build_trip_metrics_job.yml  gold scorecard workflow (table update trigger)
 ├── src/
 │   ├── catalog/
-│   │   └── ddl/                  schemas/: the layer schemas, applied first
+│   │   └── schemas/              ddl_schemas_v001_create.sql …: the layer schemas, applied first
 │   ├── 00_bronze/
-│   │   ├── notebooks/            ingest.py (every table source), ingest_files.py (Auto Loader: the landing volume)
-│   │   └── ddl/                  one folder per table: nyctaxi_trips/, tpch_orders/, landing/ …
+│   │   ├── _ingestion/           generic, serves every source: notebook_ingest.py (tables), notebook_ingest_files.py (Auto Loader)
+│   │   ├── nyctaxi_trips/        ddl_nyctaxi_trips_v001_create.sql, …_v002_rename.sql, …_v003_alter.sql
+│   │   └── tpch_orders/, landing/, landing_trips/ …   one folder per bronze table, DDL only
 │   ├── 01_silver/
-│   │   ├── notebooks/            clean_trips.py
-│   │   └── ddl/                  trips/, trips_quarantine/
+│   │   └── trips/                notebook_clean_trips.py, ddl_trips_*.sql, ddl_trips_quarantine_*.sql
 │   ├── 02_gold/
-│   │   ├── notebooks/            build_trip_metrics.py (incremental from silver's change feed)
-│   │   └── ddl/                  agg_trips_daily/, agg_trips_by_pickup_zip/
+│   │   └── trip_metrics/         notebook_build_trip_metrics.py (incremental from silver's change feed), ddl_agg_trips_*.sql
 │   ├── ops/
-│   │   ├── notebooks/            apply_ddl.py (the migration runner), maintain_tables.py (OPTIMIZE / REORG / VACUUM)
-│   │   └── ddl/                  processed_versions/
+│   │   ├── schema_migrations/    notebook_apply_ddl.py: the migration runner (it creates its own history table)
+│   │   ├── processed_versions/   ddl_processed_versions_v001_create.sql: gold's change-feed watermark
+│   │   └── _maintenance/         notebook_maintain_tables.py: OPTIMIZE / REORG / VACUUM over every table
 │   ├── tools/
-│   │   └── notebooks/            seed_landing_files.py: drops JSON files in the volume, standing in for an external system
+│   │   └── landing/              notebook_seed_landing_files.py: drops JSON files in the volume, standing in for an external system
 │   └── medallion/                sources, bronze, silver, gold, quality, contract, migrations, maintenance: the tested logic
 ├── tests/                        pytest on local PySpark
 ├── scripts/
@@ -141,7 +141,7 @@ flowchart LR
 └── requirements.txt · .env.example
 ```
 
-Folders under `src/` match the schema each process writes to (plus `ops/` for tooling and `tools/` for demo helpers). Inside each, `notebooks/` holds what the jobs run and `ddl/` holds the migrations; the job definitions are in `resources/`. Files are named after what the process does.
+Folders under `src/` match the schema each process writes to (plus `ops/` for tooling and `tools/` for demo helpers). Inside each, **one folder per process** holds its notebook and the DDL of the tables it writes; `_`-prefixed folders hold generic code that serves every table. The file prefix says what a file is: `notebook_` is what a job runs, `ddl_<table>_v<NNN>_<verb>.sql` a migration. The job definitions are in `resources/`.
 
 ---
 
@@ -203,7 +203,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)               # only needed for
 ### Add a bronze table
 
 1. Add a `[[sources]]` entry to [`config/sources.toml`](config/sources.toml): `table`, `mode` (`append` / `overwrite`), `schedule` (Quartz cron, UTC). The bronze table and job names are derived: `samples.tpch.lineitem` → `tpch_lineitem`, `ingest_tpch_lineitem`.
-2. `.venv/bin/python scripts/new_bronze_migration.py tpch_lineitem`: writes `src/00_bronze/ddl/bronze_tpch_lineitem_v001_create.sql` from the source's real schema. Review it.
+2. `.venv/bin/python scripts/new_bronze_migration.py tpch_lineitem`: writes `src/00_bronze/tpch_lineitem/ddl_tpch_lineitem_v001_create.sql` from the source's real schema. Review it.
 3. `.venv/bin/pytest tests/test_sources.py tests/test_migrations.py`: the config and the migrations must pass validation (CI checks them too).
 4. `databricks bundle deploy`, then `databricks bundle run apply_ddl` to create the table, then run `ingest_<name>`.
 
@@ -220,7 +220,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)               # only needed for
 | `.venv/bin/python scripts/measure_pruning.py "<query>"` | Files read vs pruned for a query, from query history |
 | `.venv/bin/python scripts/new_bronze_migration.py <name>` | Generate a bronze table's `…_v001_create.sql` from its source schema (`--dry-run` prints it) |
 
-Change a table by adding the next version to its folder, e.g. `src/02_gold/ddl/agg_trips_daily/v003_alter.sql`. **Never edit an applied migration:** the runner refuses to continue until the file matches what ran.
+Change a table by adding the next version next to the others, e.g. `src/02_gold/trip_metrics/ddl_agg_trips_daily_v003_alter.sql`. **Never edit an applied migration:** the runner refuses to continue until the file matches what ran.
 
 ### Jobs and runs
 
@@ -274,9 +274,9 @@ The same medallion idea as [dbt-terraform-postgres-medallion](https://github.com
 
 | dbt | Here |
 |---|---|
-| `models/00_bronze`, `01_silver`, `02_gold` folders | `src/00_bronze/`, `01_silver/`, `02_gold/`, one folder per schema |
+| `models/00_bronze`, `01_silver`, `02_gold` folders | `src/00_bronze/`, `01_silver/`, `02_gold/`, one folder per schema, one subfolder per process |
 | `_sources.yml` | `config/sources.toml`, which also generates the ingestion jobs |
-| Model `config(materialized=...)` creates the relation | Versioned DDL migrations per table (`src/<NN_layer>/ddl/`), applied by `apply_ddl` |
+| Model `config(materialized=...)` creates the relation | Versioned DDL migrations per table (`src/<NN_layer>/<process>/ddl_*.sql`), applied by `apply_ddl` |
 | The DAG from `ref()` | Table update triggers: each workflow runs when its input tables change |
 | `materialized: incremental` + `unique_key` | Delta `MERGE` on `trip_id` (insert-only) |
 | Snapshots (SCD2) | Append-only bronze batches plus Delta time travel (`VERSION AS OF`) |

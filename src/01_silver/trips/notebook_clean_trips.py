@@ -44,8 +44,8 @@ quarantine_table = f"{silver_schema}.trips_quarantine"
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Both tables are created and changed only by DDL migrations in `src/01_silver/ddl/` (the `apply_ddl` job). This
-# MAGIC notebook only merges rows into them, and Delta rejects any row that doesn't match their declared schema.
+# MAGIC Both tables are created and changed only by the DDL migrations next to this notebook (`ddl_trips_*.sql`,
+# MAGIC `ddl_trips_quarantine_*.sql`), applied by the `apply_ddl` job. This notebook only merges rows into them, and Delta rejects any row that doesn't match their declared schema.
 
 # COMMAND ----------
 

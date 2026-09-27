@@ -35,4 +35,4 @@ resources:
       tasks:
         - task_key: maintain_tables
           notebook_task:
-            notebook_path: ../src/ops/notebooks/maintain_tables.py
+            notebook_path: ../src/ops/_maintenance/notebook_maintain_tables.py

@@ -3,15 +3,16 @@
 # MAGIC # Apply DDL migrations
 # MAGIC
 # MAGIC Tables are created and changed only here, never by the jobs that write to them. This notebook applies the
-# MAGIC write-once SQL files in `src/<NN_layer>/ddl/<table>/` (plus `catalog/` and `ops/`) that haven't run yet and records each one in
-# MAGIC `<catalog>.ops.schema_migrations`. Each table has one folder, named as the table is called now, holding its whole
-# MAGIC history: `v001_create.sql`, `v002_rename.sql`, `v003_alter.sql`, …
+# MAGIC write-once SQL files `src/<NN_layer>/<process>/ddl_<table>_v<NNN>_<verb>.sql` (plus `catalog/` and `ops/`) that
+# MAGIC haven't run yet and records each one in `<catalog>.ops.schema_migrations`. Each file sits next to the process that
+# MAGIC writes the table and is named as the table is called now, so a table's whole history is in one folder:
+# MAGIC `ddl_nyctaxi_trips_v001_create.sql`, `…_v002_rename.sql`, `…_v003_alter.sql`.
 # MAGIC
 # MAGIC **Run order:** `catalog/` (the schemas) first, then layer folders (00, 01, 02, then ops), tables by name, versions
 # MAGIC ascending.
 # MAGIC
 # MAGIC **A migration is identified by the checksum of its content, not by its path**, so renaming a table (which moves
-# MAGIC and renumbers its files) doesn't re-apply anything: the history rows are refreshed instead.
+# MAGIC and renames its files) doesn't re-apply anything: the history rows are refreshed instead.
 # MAGIC
 # MAGIC - **Reruns do nothing:** applied versions are skipped.
 # MAGIC - **Applied migrations are write-once:** if one was edited, renamed or deleted since it ran, the run fails before
