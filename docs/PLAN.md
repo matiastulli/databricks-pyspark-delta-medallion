@@ -528,7 +528,7 @@ Built:
   ```
   The layer prefix is gone from the file names: the parent folder already says it.
 - **Identity by checksum.** `Migration.checksum` is the identity; the recorded path and key are information the runner refreshes. `moved_migrations` reports the files that moved, and `apply_ddl` updates their history rows.
-- **Renames stopped being special.** A rename is a version inside the table's folder, so the runner lost its rename parsing and the topological ordering that kept a renamed table after its source. Run order is simply: `schemas`, layer folders (00, 01, 02, ops), tables by name, versions ascending.
+- **Renames stopped being special.** A rename is a version inside the table's folder, so the runner lost its rename parsing and the topological ordering that kept a renamed table after its source. Run order is simply: `schemas`, layer folders (00, 01, 02, ops), tables by name, versions ascending (since the follow-up below: folders catalog, 00, 01, 02, ops).
 - **Rules per folder:** `v001` creates, later versions alter / rename / drop; versions must be contiguous and unique.
 - `render_bronze_migration` and `scripts/new_bronze_migration.py` now write `00_bronze/ddl/<table>/v001_create.sql`.
 
@@ -537,6 +537,12 @@ Verified on the workspace:
 - The real run refreshed the 25 history rows; a second run reported **0 moved, 0 pending**.
 - `ops.schema_migrations` now reads as the folders do, e.g. `bronze_nyctaxi_trips` v001–v003 pointing at `00_bronze/ddl/nyctaxi_trips/`.
 - **No manual SQL this time.** The step 8 rename needed a hand-written `UPDATE` of the history; with checksum identity the runner fixes itself.
+
+**Follow-up: the schemas leave `00_bronze/`.** `schemas/v001_create.sql` creates all three layer schemas, so living under `00_bronze/ddl/` made it look like a bronze table called `schemas`; it was there only because bronze runs first, and the runner special-cased the name to sort it first. The user's decision: move it to **`src/catalog/ddl/schemas/`**, a folder for catalog-level objects that runs before the layers.
+- The runner accepts `catalog` as a folder and runs it first by folder order, replacing the "key is `schemas`" sorting rule. `schemas` is valid **only** there, and `catalog/` holds nothing else, so a layer folder named `schemas` can no longer silently take the special key.
+- The key stays `schemas` and the checksums don't change, so the move is free: `apply_ddl` just refreshes the two history rows' paths.
+- The `ops` schema stays with the runner: `ops.schema_migrations` has to exist before any migration can be recorded.
+- Verified on the workspace: the dry run reported **25 already applied, 2 moved, 0 pending**; the real run refreshed the two rows, and a second run reported 0 moved, 0 pending.
 
 **Rejected alternatives:**
 - **Keep the birth name forever** (`bronze_trips_v003_alter.sql` for a table now called `nyctaxi_trips`): cheapest, no runner change, but a renamed table's files stay under the old name, which is the complaint.

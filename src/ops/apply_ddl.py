@@ -3,11 +3,12 @@
 # MAGIC # Apply DDL migrations
 # MAGIC
 # MAGIC Tables are created and changed only here, never by the jobs that write to them. This notebook applies the
-# MAGIC write-once SQL files in `src/<NN_layer>/ddl/<table>/` that haven't run yet and records each one in
+# MAGIC write-once SQL files in `src/<NN_layer>/ddl/<table>/` (plus `catalog/` and `ops/`) that haven't run yet and records each one in
 # MAGIC `<catalog>.ops.schema_migrations`. Each table has one folder, named as the table is called now, holding its whole
 # MAGIC history: `v001_create.sql`, `v002_rename.sql`, `v003_alter.sql`, …
 # MAGIC
-# MAGIC **Run order:** `schemas` first, then layer folders (00, 01, 02, then ops), tables by name, versions ascending.
+# MAGIC **Run order:** `catalog/` (the schemas) first, then layer folders (00, 01, 02, then ops), tables by name, versions
+# MAGIC ascending.
 # MAGIC
 # MAGIC **A migration is identified by the checksum of its content, not by its path**, so renaming a table (which moves
 # MAGIC and renumbers its files) doesn't re-apply anything: the history rows are refreshed instead.

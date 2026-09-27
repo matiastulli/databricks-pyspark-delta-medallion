@@ -1,9 +1,9 @@
 """Table DDL as write-once SQL migrations, one folder per table, applied by a small in-repo runner.
 
-Migrations live next to the code of the schema they belong to, one folder per table (and `src/ops/ddl/` for tooling
-tables, which run last):
+Migrations live next to the code of the schema they belong to, one folder per table. Two folders aren't layers:
+`src/catalog/ddl/schemas/` creates the layer schemas and runs first, and `src/ops/ddl/` holds tooling tables and runs last:
 
-    src/00_bronze/ddl/schemas/v001_create.sql
+    src/catalog/ddl/schemas/v001_create.sql
     src/00_bronze/ddl/nyctaxi_trips/v001_create.sql
                                    /v002_rename.sql   ALTER TABLE trips RENAME TO nyctaxi_trips
                                    /v003_alter.sql
@@ -28,14 +28,16 @@ from pathlib import Path
 # src/medallion/migrations.py -> src/. The bundle deploys src/ as a whole, so this works on Databricks too.
 SRC_DIR = Path(__file__).resolve().parents[1]
 
-# A layer folder (00_bronze …) or `ops`, which holds tooling tables and runs last, after the layers it supports.
-LAYER_FOLDER = re.compile(r"^(?:(?P<order>\d{2})_(?P<layer>bronze|silver|gold)|(?P<ops>ops))$")
+# A layer folder (00_bronze …), `catalog`, which creates the layer schemas and runs first, or `ops`, which holds tooling
+# tables and runs last, after the layers it supports.
+LAYER_FOLDER = re.compile(r"^(?:(?P<order>\d{2})_(?P<layer>bronze|silver|gold)|(?P<catalog>catalog)|(?P<ops>ops))$")
 TABLE_FOLDER = re.compile(r"^[a-z][a-z0-9_]*$")
 FILE_NAME = re.compile(r"^v(?P<version>\d{3})_(?P<verb>create|alter|rename|drop)\.sql$")
 PLACEHOLDER = re.compile(r"\$\{([a-z_]+)\}")
 PLACEHOLDERS = ("catalog", "bronze_schema", "silver_schema", "gold_schema")
 
 SCHEMAS = "schemas"
+CATALOG_ORDER = -1
 OPS_ORDER = 99
 HISTORY_SCHEMA = "ops"
 HISTORY_TABLE = "schema_migrations"
@@ -59,15 +61,15 @@ class Migration:
 def parse_migrations(files: dict[str, str]) -> list[Migration]:
     """Validates migration files (path relative to src/ -> content) and returns them in the order they must run.
 
-    Raises ValueError listing every problem found. Order: `schemas` first, then layer folders in order (00, 01, 02,
-    then ops), tables by name, and each table's versions ascending.
+    Raises ValueError listing every problem found. Order: folders (catalog, 00, 01, 02, then ops), tables by name,
+    and each table's versions ascending.
     """
     problems, migrations = [], []
     for path, sql in sorted(files.items()):
         parts = Path(path).parts
         folder = LAYER_FOLDER.match(parts[0]) if len(parts) == 4 and parts[1] == "ddl" else None
         if not folder:
-            problems.append(f"{path}: must be src/<NN_layer or ops>/ddl/<table>/<file>, e.g. 00_bronze/ddl/nyctaxi_trips/v001_create.sql")
+            problems.append(f"{path}: must be src/<NN_layer, catalog or ops>/ddl/<table>/<file>, e.g. 00_bronze/ddl/nyctaxi_trips/v001_create.sql")
             continue
         table = parts[2]
         if not TABLE_FOLDER.match(table):
@@ -78,15 +80,21 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
             problems.append(f"{path}: must be named v<NNN>_<create|alter|rename|drop>.sql")
             continue
 
+        # The schemas are the catalog's only DDL, and the only migration whose key isn't <layer>_<table>.
+        if (table == SCHEMAS) != bool(folder["catalog"]):
+            problems.append(f"{path}: the schemas live in catalog/ddl/schemas/, and catalog/ holds nothing else")
+            continue
+
         version, verb = int(name["version"]), name["verb"]
         layer = folder["layer"] or folder["ops"]
-        key = SCHEMAS if table == SCHEMAS else f"{layer}_{table}"
+        key = SCHEMAS if folder["catalog"] else f"{layer}_{table}"
         # A table's history starts by creating it; everything after that changes what is already there.
         if verb == "create" and version != 1:
             problems.append(f"{path}: create can only be v001; change an existing table with alter, rename or drop")
         if verb != "create" and version == 1:
             problems.append(f"{path}: v001 must create the table")
-        migrations.append(Migration(key, version, verb, path, sql, int(folder["order"]) if folder["order"] else OPS_ORDER))
+        order = CATALOG_ORDER if folder["catalog"] else int(folder["order"]) if folder["order"] else OPS_ORDER
+        migrations.append(Migration(key, version, verb, path, sql, order))
 
     by_key: dict[str, list[Migration]] = {}
     for migration in migrations:
@@ -100,7 +108,7 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
 
     if problems:
         raise ValueError("invalid migrations:\n  " + "\n  ".join(problems))
-    return sorted(migrations, key=lambda m: (m.key != SCHEMAS, m.folder_order, m.key, m.version))
+    return sorted(migrations, key=lambda m: (m.folder_order, m.key, m.version))
 
 
 def load_migrations(src_dir: Path = SRC_DIR) -> list[Migration]:

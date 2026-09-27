@@ -27,7 +27,7 @@ def test_the_committed_migrations_are_valid_and_start_with_the_schemas():
     # Runs in CI, so a misplaced, badly named, duplicated or missing migration fails before anyone applies it.
     migrations = load_migrations()
 
-    assert migrations[0].path == "00_bronze/ddl/schemas/v001_create.sql"
+    assert migrations[0].path == "catalog/ddl/schemas/v001_create.sql"
     # A renamed table keeps one history under its current name.
     assert [m.path for m in migrations if m.key == "bronze_nyctaxi_trips"] == [
         "00_bronze/ddl/nyctaxi_trips/v001_create.sql",
@@ -36,7 +36,7 @@ def test_the_committed_migrations_are_valid_and_start_with_the_schemas():
     ]
 
 
-def test_run_order_is_schemas_then_layer_folders_then_table_then_version():
+def test_run_order_is_catalog_then_layer_folders_then_table_then_version():
     assert run_order(
         "ops/ddl/processed_versions/v001_create.sql",
         "02_gold/ddl/agg_trips_daily/v001_create.sql",
@@ -45,9 +45,9 @@ def test_run_order_is_schemas_then_layer_folders_then_table_then_version():
         "01_silver/ddl/trips/v002_alter.sql",
         "00_bronze/ddl/tpch_orders/v001_create.sql",
         *[f"01_silver/ddl/trips/v{v:03d}_alter.sql" for v in range(3, 10)],
-        "00_bronze/ddl/schemas/v001_create.sql",
+        "catalog/ddl/schemas/v001_create.sql",
     ) == [
-        "00_bronze/ddl/schemas/v001_create.sql",
+        "catalog/ddl/schemas/v001_create.sql",
         "00_bronze/ddl/tpch_orders/v001_create.sql",
         "01_silver/ddl/trips/v001_create.sql",
         *[f"01_silver/ddl/trips/v{v:03d}_alter.sql" for v in range(2, 11)],  # v010 after v009, not after v001
@@ -59,14 +59,16 @@ def test_run_order_is_schemas_then_layer_folders_then_table_then_version():
 @pytest.mark.parametrize(
     "paths, message",
     [
-        (["01_silver/ddl/trips_v001_create.sql"], "must be src/<NN_layer or ops>/ddl/<table>/<file>"),
-        (["01_silver/trips/v001_create.sql"], "must be src/<NN_layer or ops>/ddl/<table>/<file>"),
+        (["01_silver/ddl/trips_v001_create.sql"], "must be src/<NN_layer, catalog or ops>/ddl/<table>/<file>"),
+        (["01_silver/trips/v001_create.sql"], "must be src/<NN_layer, catalog or ops>/ddl/<table>/<file>"),
         (["01_silver/ddl/Trips/v001_create.sql"], "must be the table name in lowercase"),
         (["01_silver/ddl/trips/create_v001.sql"], "must be named v<NNN>_"),
         (["01_silver/ddl/trips/v001_update.sql"], "must be named v<NNN>_"),  # unknown verb
         (["01_silver/ddl/trips/v001_alter.sql"], "v001 must create the table"),
         (["01_silver/ddl/trips/v001_create.sql", "01_silver/ddl/trips/v002_create.sql"], "create can only be v001"),
         (["01_silver/ddl/trips/v001_create.sql", "01_silver/ddl/trips/v003_alter.sql"], r"missing versions \['v002'\]"),
+        (["00_bronze/ddl/schemas/v001_create.sql"], "the schemas live in catalog/ddl/schemas/"),  # not a bronze table
+        (["catalog/ddl/landing/v001_create.sql"], "catalog/ holds nothing else"),
     ],
 )
 def test_misplaced_misnamed_or_inconsistent_migrations_are_rejected(paths, message):
@@ -75,7 +77,7 @@ def test_misplaced_misnamed_or_inconsistent_migrations_are_rejected(paths, messa
 
 
 def test_only_migrations_not_yet_applied_are_pending():
-    migrations = parse_migrations(files("00_bronze/ddl/schemas/v001_create.sql", "01_silver/ddl/trips/v001_create.sql", "01_silver/ddl/trips/v002_alter.sql"))
+    migrations = parse_migrations(files("catalog/ddl/schemas/v001_create.sql", "01_silver/ddl/trips/v001_create.sql", "01_silver/ddl/trips/v002_alter.sql"))
 
     assert [m.path for m in pending_migrations(migrations, applied_from(migrations[:2]))] == ["01_silver/ddl/trips/v002_alter.sql"]
     assert pending_migrations(migrations, applied_from(migrations)) == []

@@ -66,7 +66,7 @@ flowchart LR
 **Tables as code: DDL migrations**
 - **Jobs never create tables.** Every published table has its own folder of write-once SQL, named as the table is called now: `src/01_silver/ddl/trips/v001_create.sql`, `v002_alter.sql`, `v003_alter.sql`. The `apply_ddl` workflow applies the pending ones and records them in `ops.schema_migrations`.
 - **A migration is identified by the checksum of its content, not its path**, so renaming a table (its folder, and the renumbering that follows) re-applies nothing: a rename is just another version inside the folder, and the whole history of a table stays in one place.
-- **A small in-repo runner** ([`migrations.py`](src/medallion/migrations.py), unit-tested): schemas first, then layer folders, tables and versions, with renames after the table they rename. It refuses an applied migration that was edited or deleted, and misplaced, misnamed, duplicate or missing versions.
+- **A small in-repo runner** ([`migrations.py`](src/medallion/migrations.py), unit-tested): the schemas first (`src/catalog/ddl/schemas/`), then layer folders, tables and versions, with renames after the table they rename. It refuses an applied migration that was edited or deleted, and misplaced, misnamed, duplicate or missing versions.
 - **Adopted without rewriting anything:** the baseline migrations reproduce the 12 existing tables exactly (117 columns: types, `NOT NULL`, comments; checked against a fresh catalog). Applying them left every table's Delta version and row count unchanged.
 - **A naming convention, applied through migrations:** bronze `<source_system>_<source_table>` (derived from the config), silver plural entities, gold `fct_` / `dim_` / `agg_<subject>_<grain>`. Three tables were renamed with `ALTER TABLE … RENAME TO`, and their data, history and comments moved with them.
 - **A write contract:** before writing, every job checks that its DataFrame matches the table's columns and types exactly. Delta rejects extra columns, `NOT NULL` violations and impossible casts, but on Databricks it silently accepted a missing nullable column (filled with null), so the jobs check first.
@@ -113,11 +113,13 @@ flowchart LR
 │   ├── clean_trips_job.yml       silver workflow (table update trigger)
 │   └── build_trip_metrics_job.yml  gold scorecard workflow (table update trigger)
 ├── src/
+│   ├── catalog/
+│   │   └── ddl/                  schemas/: the layer schemas, applied first
 │   ├── 00_bronze/
 │   │   ├── ingest.py             one generic notebook for every table source
 │   │   ├── ingest_files.py       Auto Loader: files from the landing volume
 │   │   ├── seed_landing_files.py drops JSON files in the volume, standing in for an external system
-│   │   └── ddl/                  one folder per table: schemas/, nyctaxi_trips/, tpch_orders/, landing/ …
+│   │   └── ddl/                  one folder per table: nyctaxi_trips/, tpch_orders/, landing/ …
 │   ├── 01_silver/
 │   │   ├── clean_trips.py
 │   │   └── ddl/                  trips/, trips_quarantine/
