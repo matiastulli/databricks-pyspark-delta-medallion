@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** ✅ all steps done (0–12)
+**Status:** ✅ all steps done (0–13)
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -19,6 +19,7 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 10. Auto Loader | ✅ Done | File ingestion from a UC volume with Auto Loader, `availableNow` and a checkpoint |
 | 11. Change Data Feed | ✅ Done | An incremental gold built from silver's change feed instead of a full rebuild |
 | 12. DDL folder per table | ✅ Done | A table's whole history in one folder named after it, with migrations identified by checksum instead of path |
+| 13. Folders say what they hold | ✅ Done | Notebooks in a `notebooks/` folder next to `ddl/` in every `src/` folder, and the demo helper out of bronze into `src/tools/` |
 
 ## Constraints that shape every step
 
@@ -181,7 +182,7 @@ Built:
   - `trips` uses `append`
   - 7 TPC-H tables use `overwrite` (full snapshots)
   - `lineitem` (30M rows) is left out to protect Free Edition quota
-- **One generic [`ingest.py`](../src/00_bronze/ingest.py)**, parameterized by `source`
+- **One generic [`ingest.py`](../src/00_bronze/notebooks/ingest.py)**, parameterized by `source`
 - **Config validation** in [`src/medallion/sources.py`](../src/medallion/sources.py), with 7 tests: required and unknown keys, identifiers, `catalog.schema.table`, known `mode`, unique names and targets, and the committed config is valid
 
 Tried first, then replaced: one job with a `list_sources` task and a `for_each_task` fanning `ingest.py` out over every source. It worked (8/8 iterations, row counts matched, `overwrite` stayed at one batch on rerun). But it runs every source at the same moment, which is the problem described above.
@@ -363,7 +364,7 @@ Built and verified on the workspace:
 - **Migrations and runner:**
   - 17 migrations: the schemas (`schemas_v001_create`, plus `schemas_v002_alter` for the comments), 12 table baselines, and 3 renames
   - [`src/medallion/migrations.py`](../src/medallion/migrations.py) holds the logic (18 tests)
-  - [`src/ops/apply_ddl.py`](../src/ops/apply_ddl.py) is the runner, deployed as the [`apply_ddl`](../resources/apply_ddl_job.yml) job with `dry_run`
+  - [`src/ops/apply_ddl.py`](../src/ops/notebooks/apply_ddl.py) is the runner, deployed as the [`apply_ddl`](../resources/apply_ddl_job.yml) job with `dry_run`
   - [`scripts/setup_unity_catalog.sh`](../scripts/setup_unity_catalog.sh) now creates only the catalog
 - **The baseline matches reality exactly.** All migrations applied to a fresh throwaway catalog produced the same 12 tables as `medallion`: 117 columns with identical order, types, `NOT NULL` and comments, plus identical table comments. The comparison also caught one mismatch: the schema comments in `schemas_v001_create` had been rewritten instead of copied. They were restored in v001 and changed properly in `schemas_v002_alter`.
 - **Drift detection works on Databricks.** Rerunning on the throwaway catalog after that edit failed with `schemas_v001_create.sql changed after it was applied`, and nothing ran.
@@ -402,7 +403,7 @@ Note: **least privilege** can only be documented here, not demonstrated. Free Ed
 Built and measured:
 - **Table properties through migrations:** `bronze_nyctaxi_trips_v002_alter.sql`, `silver_trips_v002_alter.sql` and `silver_trips_quarantine_v002_alter.sql` set `delta.autoOptimize.optimizeWrite` and `autoCompact` on the tables that get a write on every run. Each migration says what the property does and when it acts (before the write vs after the commit).
 - **Liquid clustering:** `bronze_tpch_orders_v002_alter.sql` sets `CLUSTER BY (o_orderdate)`, and the first `OPTIMIZE FULL` clustered the existing 7.5M rows.
-- **[`src/ops/maintain_tables.py`](../src/ops/maintain_tables.py)** + [`maintain_tables`](../resources/maintain_tables_job.yml), weekly (Sunday 07:00 UTC, paused in dev): `OPTIMIZE` (with `optimize_full`), optional `REORG TABLE … APPLY (PURGE)`, and `VACUUM` in **dry run by default**. It discovers the tables itself, skips `_tmp_` ones, and reports files, size and clustering before and after. [`src/medallion/maintenance.py`](../src/medallion/maintenance.py) holds the tested part (3 tests).
+- **[`src/ops/maintain_tables.py`](../src/ops/notebooks/maintain_tables.py)** + [`maintain_tables`](../resources/maintain_tables_job.yml), weekly (Sunday 07:00 UTC, paused in dev): `OPTIMIZE` (with `optimize_full`), optional `REORG TABLE … APPLY (PURGE)`, and `VACUUM` in **dry run by default**. It discovers the tables itself, skips `_tmp_` ones, and reports files, size and clustering before and after. [`src/medallion/maintenance.py`](../src/medallion/maintenance.py) holds the tested part (3 tests).
 - **[`scripts/measure_pruning.py`](../scripts/measure_pruning.py)** runs a query and reports files read vs pruned from query history.
 
 **The measurement, on `00_bronze.tpch_orders` (7.5M rows, 165 MB):**
@@ -439,8 +440,8 @@ So file skipping went from nothing to half the table, on a table where every fil
 Built:
 - **A Unity Catalog volume, created by DDL** like everything else: [`bronze_landing_v001_create.sql`](../src/00_bronze/ddl/bronze_landing_v001_create.sql). Files land under `/Volumes/medallion/00_bronze/landing/<source>/`, and the Auto Loader checkpoints live beside them under `landing/_checkpoints/`.
 - **`kind` in `config/sources.toml`.** A source is either a `table` (copied by `ingest.py`) or `files` (picked up by `ingest_files.py`), and each kind requires its own settings, which the config validation enforces. Both kinds keep the same naming convention: for files the "source system" is the volume, so `landing/trips` becomes `landing_trips` and the job is `ingest_landing_trips`. `resources/__init__.py` picks the notebook from the kind.
-- **[`src/00_bronze/seed_landing_files.py`](../src/00_bronze/seed_landing_files.py)** (job `seed_landing_files`, no schedule) writes one JSON folder per pickup date, standing in for the system that would drop files. `mode("ignore")` leaves dates already written alone, so raising `days` makes *new* files arrive.
-- **[`src/00_bronze/ingest_files.py`](../src/00_bronze/ingest_files.py)** reads with `cloudFiles`:
+- **[`src/00_bronze/seed_landing_files.py`](../src/tools/notebooks/seed_landing_files.py)** (job `seed_landing_files`, no schedule) writes one JSON folder per pickup date, standing in for the system that would drop files. `mode("ignore")` leaves dates already written alone, so raising `days` makes *new* files arrive.
+- **[`src/00_bronze/ingest_files.py`](../src/00_bronze/notebooks/ingest_files.py)** reads with `cloudFiles`:
   - `trigger(availableNow=True)`: take everything that has arrived, then stop. Same code as a live stream, run on a schedule.
   - the checkpoint lives in the volume, one per source
   - **the schema comes from the target table**, not from inference, so a file that no longer matches the DDL fails instead of quietly changing the table. That also makes `cloudFiles.schemaLocation` unnecessary.
@@ -472,7 +473,7 @@ Built:
 - **`delta.enableChangeDataFeed` on silver** ([`silver_trips_v003_alter.sql`](../src/01_silver/ddl/silver_trips_v003_alter.sql)), so Delta records the row-level inserts, updates and deletes of each version.
 - **A watermark table**, [`ops.processed_versions`](../src/ops/ddl/ops_processed_versions_v001_create.sql): the last source version each process consumed. The migration runner now also accepts `src/ops/ddl/`, ordered after the layer folders.
 - **[`src/medallion/incremental.py`](../src/medallion/incremental.py)** (5 tests): `plan_run` decides full rebuild / incremental / nothing to do, and `changed_keys` collects the keys the feed touched. **A deleted row counts as much as an inserted one:** its date has to be recomputed, or the aggregate keeps counting trips that are gone.
-- **[`build_trip_metrics.py`](../src/02_gold/build_trip_metrics.py) now does both:**
+- **[`build_trip_metrics.py`](../src/02_gold/notebooks/build_trip_metrics.py) now does both:**
   - `agg_trips_daily` is **incremental**: read the change feed since the watermark, recompute only those dates from silver, `MERGE` them, and delete dates whose trips are all gone
   - `agg_trips_by_pickup_zip` is **still a full rebuild**: it's a ranking, and a rank depends on every row, so one changed trip can move many ZIPs
   - `full_rebuild=true` ignores the watermark, for when an aggregation itself changes
@@ -547,6 +548,27 @@ Verified on the workspace:
 **Rejected alternatives:**
 - **Keep the birth name forever** (`bronze_trips_v003_alter.sql` for a table now called `nyctaxi_trips`): cheapest, no runner change, but a renamed table's files stay under the old name, which is the complaint.
 - **A generated index** mapping current tables to their files: additive and safe, but tracking still means consulting an index instead of the folder.
+
+## 13. Folders say what they hold ✅
+
+**Goal:** tell at a glance what a file is. Until now a layer folder mixed notebooks (`ingest.py`) with the `ddl/` folder, and `seed_landing_files.py` sat in bronze although it's a demo helper, not part of the pipeline.
+
+**Decisions (the user's):**
+- **Every folder under `src/` separates its kinds of content:** `notebooks/` for the Databricks notebooks that jobs run, `ddl/` for migrations. The folder is called `notebooks/` because that's what the files are; the *jobs* are the definitions in `resources/`.
+- **The seed helper moves to `src/tools/notebooks/`:** it stands in for an external system dropping files, so it doesn't belong to the bronze layer.
+- **Unchanged:** `src/medallion/` (the tested library), `resources/` (the Asset Bundle's job definitions, the usual bundle layout), `config/`, `scripts/`.
+
+**What follows from it:**
+- Notebooks sit one level deeper, so their first cell adds `../..` instead of `..` to `sys.path`
+- Job notebook paths in `resources/*.yml` and `resources/__init__.py`
+- **Applied migrations keep mentioning the old paths in their comments.** Editing them would change their checksum and fail `apply_ddl`, so they stay as history. The same goes for the comment on `ops.schema_migrations`, which the runner only sets when it creates the table.
+- Check: `bundle validate`, `bundle deploy` (removes the old workspace files), and real runs of the moved notebooks to prove the imports still resolve on serverless
+
+Verified on the workspace:
+- `bundle deploy`: 19 files uploaded, **7 deleted** (the old notebook paths), 14 jobs updated
+- The `../..` import cell resolves on serverless: `apply_ddl` (dry run: 25 applied, 0 moved, 0 pending, so the runner still finds every migration), `ingest_landing_trips` (0 rows, the checkpoint is untouched), `clean_trips` (0 inserted), `build_trip_metrics` (incremental, 0 dates rebuilt, 13/13 checks) all succeeded
+- Not rerun, to save quota: `ingest_nyctaxi_trips` (same notebook folder and import cell as `ingest_files.py`, and a run appends a full batch), `maintain_tables` (same import cell as `apply_ddl`), `seed_landing_files` (imports nothing; `bundle validate` shows its new path)
+- 62 tests pass
 
 ---
 

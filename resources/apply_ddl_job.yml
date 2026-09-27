@@ -25,4 +25,4 @@ resources:
       tasks:
         - task_key: apply_ddl
           notebook_task:
-            notebook_path: ../src/ops/apply_ddl.py
+            notebook_path: ../src/ops/notebooks/apply_ddl.py

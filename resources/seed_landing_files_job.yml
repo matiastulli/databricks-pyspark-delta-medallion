@@ -21,4 +21,4 @@ resources:
       tasks:
         - task_key: seed_landing_files
           notebook_task:
-            notebook_path: ../src/00_bronze/seed_landing_files.py
+            notebook_path: ../src/tools/notebooks/seed_landing_files.py

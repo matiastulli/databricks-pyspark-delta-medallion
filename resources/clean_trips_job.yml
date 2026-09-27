@@ -29,4 +29,4 @@ resources:
       tasks:
         - task_key: clean_trips
           notebook_task:
-            notebook_path: ../src/01_silver/clean_trips.py
+            notebook_path: ../src/01_silver/notebooks/clean_trips.py

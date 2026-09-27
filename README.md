@@ -116,20 +116,19 @@ flowchart LR
 │   ├── catalog/
 │   │   └── ddl/                  schemas/: the layer schemas, applied first
 │   ├── 00_bronze/
-│   │   ├── ingest.py             one generic notebook for every table source
-│   │   ├── ingest_files.py       Auto Loader: files from the landing volume
-│   │   ├── seed_landing_files.py drops JSON files in the volume, standing in for an external system
+│   │   ├── notebooks/            ingest.py (every table source), ingest_files.py (Auto Loader: the landing volume)
 │   │   └── ddl/                  one folder per table: nyctaxi_trips/, tpch_orders/, landing/ …
 │   ├── 01_silver/
-│   │   ├── clean_trips.py
+│   │   ├── notebooks/            clean_trips.py
 │   │   └── ddl/                  trips/, trips_quarantine/
 │   ├── 02_gold/
-│   │   ├── build_trip_metrics.py  incremental from silver's change feed
+│   │   ├── notebooks/            build_trip_metrics.py (incremental from silver's change feed)
 │   │   └── ddl/                  agg_trips_daily/, agg_trips_by_pickup_zip/
 │   ├── ops/
-│   │   ├── apply_ddl.py          the migration runner
-│   │   ├── maintain_tables.py    OPTIMIZE / REORG / VACUUM, weekly
+│   │   ├── notebooks/            apply_ddl.py (the migration runner), maintain_tables.py (OPTIMIZE / REORG / VACUUM)
 │   │   └── ddl/                  processed_versions/
+│   ├── tools/
+│   │   └── notebooks/            seed_landing_files.py: drops JSON files in the volume, standing in for an external system
 │   └── medallion/                sources, bronze, silver, gold, quality, contract, migrations, maintenance: the tested logic
 ├── tests/                        pytest on local PySpark
 ├── scripts/
@@ -142,7 +141,7 @@ flowchart LR
 └── requirements.txt · .env.example
 ```
 
-Folders under `src/` match the schema each process writes to, and files are named after what the process does.
+Folders under `src/` match the schema each process writes to (plus `ops/` for tooling and `tools/` for demo helpers). Inside each, `notebooks/` holds what the jobs run and `ddl/` holds the migrations; the job definitions are in `resources/`. Files are named after what the process does.
 
 ---
 

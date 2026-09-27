@@ -1,6 +1,6 @@
 """Table maintenance: which tables to maintain, and what a maintenance run changed.
 
-The SQL itself (OPTIMIZE, REORG, VACUUM) lives in src/ops/maintain_tables.py. What's here is the part worth testing:
+The SQL itself (OPTIMIZE, REORG, VACUUM) lives in src/ops/notebooks/maintain_tables.py. What's here is the part worth testing:
 picking the tables, and turning two DESCRIBE DETAIL snapshots into a readable before/after.
 """
 

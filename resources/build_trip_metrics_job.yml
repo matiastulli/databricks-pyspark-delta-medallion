@@ -30,4 +30,4 @@ resources:
       tasks:
         - task_key: build_trip_metrics
           notebook_task:
-            notebook_path: ../src/02_gold/build_trip_metrics.py
+            notebook_path: ../src/02_gold/notebooks/build_trip_metrics.py

@@ -22,6 +22,7 @@ Learning path. `docs/PLAN.md` is the only place that tracks it: update its statu
 10. Auto Loader: file ingestion from the `landing` UC volume with `availableNow` and a checkpoint; `config/sources.toml` gains `kind` (`table` | `files`)
 11. Change Data Feed: `agg_trips_daily` is built incrementally from silver's change feed with a watermark in `ops.processed_versions`; the ZIP ranking stays a full rebuild because a rank depends on every row
 12. One folder per table in `ddl/`, named as the table is called now, so a renamed table's whole history stays in one place; migrations are identified by checksum, not path
+13. Folders say what they hold: `notebooks/` next to `ddl/` in every `src/` folder, and the seed helper in `src/tools/`
 
 
 ## Environment
@@ -74,7 +75,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 .venv/bin/pytest tests/test_silver.py -k time_zone           # single test
 ```
 
-Layout: notebooks are Databricks source files (`# Databricks notebook source`, `# COMMAND ----------` between cells). `src/` has **one folder per schema** (`00_bronze/`, `01_silver/`, `02_gold/`, as the user chose), holding the processes that write to that schema. Processes are **named after what they do** (`ingest.py`, `clean_trips.py`, `build_trip_metrics.py`), never after the schema. On serverless a notebook's working directory is its own folder, so each notebook starts with a cell doing `sys.path.insert(0, os.path.abspath(".."))` to import the shared `src/medallion/` package (verified with a bundle run). Notebooks read the catalog and schema names from widgets, which the job fills in through job parameters from the bundle variables.
+Layout: notebooks are Databricks source files (`# Databricks notebook source`, `# COMMAND ----------` between cells). `src/` has **one folder per schema** (`00_bronze/`, `01_silver/`, `02_gold/`, as the user chose), holding the processes that write to that schema, plus `ops/` (tooling) and `tools/` (demo helpers outside the pipeline, e.g. `seed_landing_files`). **Inside each, files are grouped by kind (step 13): `notebooks/` for what jobs run, `ddl/` for migrations.** Job *definitions* live in `resources/`. Processes are **named after what they do** (`ingest.py`, `clean_trips.py`, `build_trip_metrics.py`), never after the schema. On serverless a notebook's working directory is its own folder, so each notebook starts with a cell doing `sys.path.insert(0, os.path.abspath("../.."))` (from `src/<folder>/notebooks/` up to `src/`) to import the shared `src/medallion/` package. Notebooks read the catalog and schema names from widgets, which the job fills in through job parameters from the bundle variables.
 
 `src/medallion/` holds all the pure, unit-tested logic. Notebooks only read tables, call these functions, write tables and orchestrate:
 - `sources.py`: `load_sources`, `get_source`, `parse_sources` (validates `config/sources.toml`), `bronze_table_name` (`samples.tpch.orders` → `tpch_orders`)
@@ -91,12 +92,12 @@ New logic goes into `src/medallion/` with tests. `DeltaTable` `MERGE`s and table
 
 **One workflow per process** (the user's production practice):
 - Bronze is config-driven. `config/sources.toml` lists every source with a `kind`:
-  - `kind = "table"`: `table`, `mode` (`append` | `overwrite`), `schedule`. Copied by `00_bronze/ingest.py`.
-  - `kind = "files"`: `volume`, `path`, `format`, `mode` (`append` only), `schedule`. Picked up by `00_bronze/ingest_files.py` with Auto Loader, `availableNow` and a checkpoint under `/Volumes/<catalog>/<bronze_schema>/<volume>/_checkpoints/<name>/`.
+  - `kind = "table"`: `table`, `mode` (`append` | `overwrite`), `schedule`. Copied by `00_bronze/notebooks/ingest.py`.
+  - `kind = "files"`: `volume`, `path`, `format`, `mode` (`append` only), `schedule`. Picked up by `00_bronze/notebooks/ingest_files.py` with Auto Loader, `availableNow` and a checkpoint under `/Volumes/<catalog>/<bronze_schema>/<volume>/_checkpoints/<name>/`.
   - Names are always derived, never configured: `<source_system>_<source_table>` for tables, `<volume>_<path>` for files (`landing_trips`).
   - **Never delete a checkpoint to "clean up":** it isn't a reset, it's a full reprocess, and bronze is append-only.
   - Auto Loader reads with the **target table's schema**, so a changed file fails instead of changing the table; the fix is a migration.
-- `resources/__init__.py` (Python-defined bundle resources, `databricks-bundles` pinned to the CLI version) generates one job `ingest_<name>` per entry. Each job runs `00_bronze/ingest.py` with job parameter `source` on its own schedule.
+- `resources/__init__.py` (Python-defined bundle resources, `databricks-bundles` pinned to the CLI version) generates one job `ingest_<name>` per entry. Each job runs `00_bronze/notebooks/ingest.py` with job parameter `source` on its own schedule.
 - `clean_trips` (silver) and `build_trip_metrics` (gold scorecard) are YAML jobs with **table update triggers** on their input table.
 - Add a bronze table by adding a config entry. Never add a notebook or job YAML for it, and never put all sources in one job.
 - Table update triggers fire only on data changes: a MERGE that inserts 0 rows commits a version but doesn't trigger downstream. This was verified on Free Edition by unpausing temporarily.

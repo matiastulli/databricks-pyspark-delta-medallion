@@ -36,7 +36,7 @@ def load_resources(bundle: Bundle) -> Resources:
                     ],
                     # No cluster settings: serverless, the only option on Free Edition.
                     # A table source is copied by ingest.py; files are picked up incrementally by Auto Loader.
-                    "tasks": [{"task_key": "ingest", "notebook_task": {"notebook_path": f"src/00_bronze/ingest{'_files' if source.kind == 'files' else ''}.py"}}],
+                    "tasks": [{"task_key": "ingest", "notebook_task": {"notebook_path": f"src/00_bronze/notebooks/ingest{'_files' if source.kind == 'files' else ''}.py"}}],
                 }
             ),
         )

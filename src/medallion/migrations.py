@@ -16,7 +16,7 @@ rename is just another version of that table, not a new identity.
 files, and that must not look like a different migration. Editing an applied migration still fails, and so does
 deleting one: those are what write-once protects.
 
-The runner itself (src/ops/apply_ddl.py) only executes SQL and records history. Everything that decides *what* runs
+The runner itself (src/ops/notebooks/apply_ddl.py) only executes SQL and records history. Everything that decides *what* runs
 and in which order lives here, free of Spark, so it can be unit-tested.
 """
 
