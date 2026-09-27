@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** ✅ all steps done (0–11)
+**Status:** ✅ all steps done (0–12)
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -18,6 +18,7 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 9. Layout + maintenance | ✅ Done | Liquid clustering and Delta table properties through migrations, plus a `maintain_tables` workflow (`OPTIMIZE`, `REORG`, `VACUUM`), measured |
 | 10. Auto Loader | ✅ Done | File ingestion from a UC volume with Auto Loader, `availableNow` and a checkpoint |
 | 11. Change Data Feed | ✅ Done | An incremental gold built from silver's change feed instead of a full rebuild |
+| 12. DDL folder per table | ✅ Done | A table's whole history in one folder named after it, with migrations identified by checksum instead of path |
 
 ## Constraints that shape every step
 
@@ -493,6 +494,53 @@ Verified on the workspace, in sequence:
 - **A failed task is retried automatically on serverless.** The failing run had two attempts, 40 seconds apart, each merging and then restoring itself (`MERGE`, `RESTORE`, `MERGE`, `RESTORE` in the table history). A job that writes has to be safe to run twice; this one is, because the merge is keyed, the rollback is per attempt, and the watermark moves only on success.
 - **`mode: none` skips the checks**, so drift introduced outside the pipeline isn't noticed until something in silver changes. That's the trade for not re-reading everything; a periodic `full_rebuild=true` run is the answer if that matters.
 - The error message from the quality checks no longer says "gold was not written", because on the incremental path it was written and then rolled back.
+
+## 12. One folder per table in `ddl/` ✅
+
+**Goal:** make a table's history easy to follow. Today it isn't: `nyctaxi_trips` is spread over three differently-named files, and `agg_trips_daily` has **nothing** under its own name, because both were renamed.
+
+```
+bronze_trips_v001_create.sql                      ← born as "trips"
+bronze_trips_to_nyctaxi_trips_v001_rename.sql     ← sorts under "trips_to_…"
+bronze_nyctaxi_trips_v002_alter.sql               ← v002 after a v001 rename
+```
+
+**The user's decision:** one folder per table, named after the table as it is called **now**, with one continuous version sequence inside it.
+
+```
+src/00_bronze/ddl/nyctaxi_trips/v001_create.sql
+                               /v002_rename.sql   ALTER TABLE trips RENAME TO nyctaxi_trips
+                               /v003_alter.sql
+src/02_gold/ddl/agg_trips_daily/v001_create.sql
+                               /v002_rename.sql
+src/00_bronze/ddl/schemas/v001_create.sql
+src/ops/ddl/processed_versions/v001_create.sql
+```
+
+The convention is unchanged in spirit (subject first, then version, then action); the subject is now the folder. The layer prefix disappears from the name, because the parent folder already says it, which also matches the rule that a table name never repeats its layer.
+
+Built:
+- **One folder per table**, named as the table is called now, with one continuous version sequence:
+  ```
+  src/00_bronze/ddl/nyctaxi_trips/v001_create.sql, v002_rename.sql, v003_alter.sql
+  src/02_gold/ddl/agg_trips_daily/v001_create.sql, v002_rename.sql
+  src/00_bronze/ddl/schemas/…      src/ops/ddl/processed_versions/…
+  ```
+  The layer prefix is gone from the file names: the parent folder already says it.
+- **Identity by checksum.** `Migration.checksum` is the identity; the recorded path and key are information the runner refreshes. `moved_migrations` reports the files that moved, and `apply_ddl` updates their history rows.
+- **Renames stopped being special.** A rename is a version inside the table's folder, so the runner lost its rename parsing and the topological ordering that kept a renamed table after its source. Run order is simply: `schemas`, layer folders (00, 01, 02, ops), tables by name, versions ascending.
+- **Rules per folder:** `v001` creates, later versions alter / rename / drop; versions must be contiguous and unique.
+- `render_bronze_migration` and `scripts/new_bronze_migration.py` now write `00_bronze/ddl/<table>/v001_create.sql`.
+
+Verified on the workspace:
+- Dry run after the re-organization: **25 already applied, 25 moved, 0 pending** — every checksum still matched, so nothing was re-applied.
+- The real run refreshed the 25 history rows; a second run reported **0 moved, 0 pending**.
+- `ops.schema_migrations` now reads as the folders do, e.g. `bronze_nyctaxi_trips` v001–v003 pointing at `00_bronze/ddl/nyctaxi_trips/`.
+- **No manual SQL this time.** The step 8 rename needed a hand-written `UPDATE` of the history; with checksum identity the runner fixes itself.
+
+**Rejected alternatives:**
+- **Keep the birth name forever** (`bronze_trips_v003_alter.sql` for a table now called `nyctaxi_trips`): cheapest, no runner change, but a renamed table's files stay under the old name, which is the complaint.
+- **A generated index** mapping current tables to their files: additive and safe, but tracking still means consulting an index instead of the folder.
 
 ---
 

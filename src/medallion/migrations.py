@@ -1,22 +1,26 @@
-"""Table DDL as write-once SQL migrations, versioned per table, applied by a small in-repo runner.
+"""Table DDL as write-once SQL migrations, one folder per table, applied by a small in-repo runner.
 
-Migrations live next to the code of the schema they belong to, in `src/<NN_layer>/ddl/` (and `src/ops/ddl/` for
-tooling tables, which run last):
+Migrations live next to the code of the schema they belong to, one folder per table (and `src/ops/ddl/` for tooling
+tables, which run last):
 
-    src/00_bronze/ddl/schemas_v001_create.sql
-    src/00_bronze/ddl/bronze_trips_v001_create.sql
-    src/00_bronze/ddl/bronze_trips_to_nyctaxi_trips_v001_rename.sql
-    src/01_silver/ddl/silver_trips_v002_alter.sql
+    src/00_bronze/ddl/schemas/v001_create.sql
+    src/00_bronze/ddl/nyctaxi_trips/v001_create.sql
+                                   /v002_rename.sql   ALTER TABLE trips RENAME TO nyctaxi_trips
+                                   /v003_alter.sql
+    src/01_silver/ddl/trips/v001_create.sql
 
-Each table (and `schemas`) has its own version sequence, starting at v001. A table's history starts with a `create` or
-with a `<layer>_<old>_to_<new>_v001_rename` that carries it over from another table.
+The folder is the table as it is called **now**, so its whole history is in one place and reads in version order. A
+rename is just another version of that table, not a new identity.
+
+**A migration is identified by the SHA-256 of its content, not by its path.** Renaming a table moves and renumbers its
+files, and that must not look like a different migration. Editing an applied migration still fails, and so does
+deleting one: those are what write-once protects.
 
 The runner itself (src/ops/apply_ddl.py) only executes SQL and records history. Everything that decides *what* runs
 and in which order lives here, free of Spark, so it can be unit-tested.
 """
 
 import hashlib
-import heapq
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,16 +30,13 @@ SRC_DIR = Path(__file__).resolve().parents[1]
 
 # A layer folder (00_bronze …) or `ops`, which holds tooling tables and runs last, after the layers it supports.
 LAYER_FOLDER = re.compile(r"^(?:(?P<order>\d{2})_(?P<layer>bronze|silver|gold)|(?P<ops>ops))$")
-OPS_ORDER = 99
-# <layer>_<table>_v<NNN>_<verb>.sql or schemas_v<NNN>_<verb>.sql (see the naming convention in docs/PLAN.md):
-# the subject first, so a table's files sort together, then its version, then what that version does.
-FILE_NAME = re.compile(
-    r"^(?:(?P<schemas>schemas)|(?P<layer>bronze|silver|gold|ops)_(?P<table>[a-z][a-z0-9_]*?))_v(?P<version>\d{3})_(?P<verb>create|alter|rename|drop)\.sql$"
-)
+TABLE_FOLDER = re.compile(r"^[a-z][a-z0-9_]*$")
+FILE_NAME = re.compile(r"^v(?P<version>\d{3})_(?P<verb>create|alter|rename|drop)\.sql$")
 PLACEHOLDER = re.compile(r"\$\{([a-z_]+)\}")
 PLACEHOLDERS = ("catalog", "bronze_schema", "silver_schema", "gold_schema")
 
 SCHEMAS = "schemas"
+OPS_ORDER = 99
 HISTORY_SCHEMA = "ops"
 HISTORY_TABLE = "schema_migrations"
 
@@ -45,55 +46,47 @@ class Migration:
     key: str  # what the migration versions: "schemas" or "<layer>_<table>", e.g. "bronze_nyctaxi_trips"
     version: int
     verb: str
-    path: str  # relative to src/, e.g. "00_bronze/ddl/bronze_trips_v001_create.sql"
+    path: str  # relative to src/, e.g. "00_bronze/ddl/nyctaxi_trips/v002_rename.sql"
     sql: str
     folder_order: int
-    renamed_from: str | None = None  # for a rename: the key of the table it carries over
 
     @property
     def checksum(self) -> str:
-        """SHA-256 of the file as written, so any edit to an applied migration is detected."""
+        """SHA-256 of the file as written: the migration's identity, so moving or renaming the file is free."""
         return hashlib.sha256(self.sql.encode("utf-8")).hexdigest()
 
 
 def parse_migrations(files: dict[str, str]) -> list[Migration]:
     """Validates migration files (path relative to src/ -> content) and returns them in the order they must run.
 
-    Raises ValueError listing every problem found. Order: `schemas` first, then layer folders in order (00, 01, 02),
-    tables by name, each table's versions ascending, and a renamed table always after the table it renames.
+    Raises ValueError listing every problem found. Order: `schemas` first, then layer folders in order (00, 01, 02,
+    then ops), tables by name, and each table's versions ascending.
     """
     problems, migrations = [], []
     for path, sql in sorted(files.items()):
         parts = Path(path).parts
-        folder = LAYER_FOLDER.match(parts[0]) if len(parts) == 3 and parts[1] == "ddl" else None
+        folder = LAYER_FOLDER.match(parts[0]) if len(parts) == 4 and parts[1] == "ddl" else None
         if not folder:
-            problems.append(f"{path}: must be in src/<NN_layer>/ddl/ or src/ops/ddl/, e.g. 00_bronze/ddl/")
+            problems.append(f"{path}: must be src/<NN_layer or ops>/ddl/<table>/<file>, e.g. 00_bronze/ddl/nyctaxi_trips/v001_create.sql")
             continue
-        name = FILE_NAME.match(parts[2])
+        table = parts[2]
+        if not TABLE_FOLDER.match(table):
+            problems.append(f"{path}: the folder {table!r} must be the table name in lowercase letters, digits and underscores")
+            continue
+        name = FILE_NAME.match(parts[3])
         if not name:
-            problems.append(f"{path}: must be named <layer>_<table>_v<NNN>_<create|alter|rename|drop>.sql or schemas_v<NNN>_<verb>.sql")
+            problems.append(f"{path}: must be named v<NNN>_<create|alter|rename|drop>.sql")
             continue
+
         version, verb = int(name["version"]), name["verb"]
-        folder_layer = folder["layer"] or folder["ops"]
-        if name["schemas"]:
-            key, renamed_from = SCHEMAS, None
-        else:
-            if name["layer"] != folder_layer:
-                problems.append(f"{path}: a {name['layer']} migration can't live in {parts[0]}/")
-                continue
-            key, renamed_from = f"{name['layer']}_{name['table']}", None
-            if verb == "rename":
-                old_new = name["table"].split("_to_")
-                if len(old_new) != 2 or not all(old_new) or old_new[0] == old_new[1]:
-                    problems.append(f"{path}: a rename must be named <layer>_<old>_to_<new>_v001_rename.sql")
-                    continue
-                key, renamed_from = f"{name['layer']}_{old_new[1]}", f"{name['layer']}_{old_new[0]}"
-        # A history starts with create (or a rename carrying another table over), so neither can come later.
-        if verb in ("create", "rename") and version != 1:
-            problems.append(f"{path}: {verb} can only be v001; change an existing table with alter")
-        if verb not in ("create", "rename") and version == 1:
-            problems.append(f"{path}: v001 must create the table (or rename another table into it)")
-        migrations.append(Migration(key, version, verb, path, sql, int(folder["order"]) if folder["order"] else OPS_ORDER, renamed_from))
+        layer = folder["layer"] or folder["ops"]
+        key = SCHEMAS if table == SCHEMAS else f"{layer}_{table}"
+        # A table's history starts by creating it; everything after that changes what is already there.
+        if verb == "create" and version != 1:
+            problems.append(f"{path}: create can only be v001; change an existing table with alter, rename or drop")
+        if verb != "create" and version == 1:
+            problems.append(f"{path}: v001 must create the table")
+        migrations.append(Migration(key, version, verb, path, sql, int(folder["order"]) if folder["order"] else OPS_ORDER))
 
     by_key: dict[str, list[Migration]] = {}
     for migration in migrations:
@@ -104,62 +97,41 @@ def parse_migrations(files: dict[str, str]) -> list[Migration]:
             problems.append(f"{key}: versions {['v%03d' % n for n in duplicates]} are used by more than one file")
         if missing := sorted(set(range(1, max(numbers) + 1)) - set(numbers)):
             problems.append(f"{key}: missing versions {['v%03d' % n for n in missing]}")
-        for migration in versions:
-            if migration.renamed_from and migration.renamed_from not in by_key:
-                problems.append(f"{migration.path}: renames {migration.renamed_from}, which has no migrations")
 
     if problems:
         raise ValueError("invalid migrations:\n  " + "\n  ".join(problems))
-    return [m for key in _key_order(by_key) for m in sorted(by_key[key], key=lambda m: m.version)]
-
-
-def _key_order(by_key: dict[str, list[Migration]]) -> list[str]:
-    """Orders keys: schemas, then folder order and name, except a renamed table waits for the table it renames."""
-
-    def priority(key: str) -> tuple:
-        return (key != SCHEMAS, min(m.folder_order for m in by_key[key]), key)
-
-    waits_for = {key: {m.renamed_from for m in migrations if m.renamed_from} for key, migrations in by_key.items()}
-    ready = [priority(key) for key, deps in waits_for.items() if not deps]
-    heapq.heapify(ready)
-    order = []
-    while ready:
-        key = heapq.heappop(ready)[-1]
-        order.append(key)
-        for other, deps in waits_for.items():
-            if key in deps:
-                deps.discard(key)
-                if not deps:
-                    heapq.heappush(ready, priority(other))
-    if len(order) != len(by_key):
-        raise ValueError(f"invalid migrations:\n  renames form a cycle: {sorted(set(by_key) - set(order))}")
-    return order
+    return sorted(migrations, key=lambda m: (m.key != SCHEMAS, m.folder_order, m.key, m.version))
 
 
 def load_migrations(src_dir: Path = SRC_DIR) -> list[Migration]:
-    return parse_migrations({path.relative_to(src_dir).as_posix(): path.read_text(encoding="utf-8") for path in sorted(src_dir.glob("*/ddl/*.sql"))})
+    return parse_migrations({path.relative_to(src_dir).as_posix(): path.read_text(encoding="utf-8") for path in sorted(src_dir.glob("*/ddl/*/*.sql"))})
 
 
-def pending_migrations(migrations: list[Migration], applied: dict[tuple[str, int], tuple[str, str]]) -> list[Migration]:
+def pending_migrations(migrations: list[Migration], applied: dict[str, tuple[str, int, str]]) -> list[Migration]:
     """Returns the migrations not applied yet, in run order.
 
-    `applied` maps (key, version) -> (path, checksum) from the history table. Applied migrations are write-once: if
-    one was edited, moved or deleted since it ran, the database and the files no longer tell the same story, so this
-    raises instead of carrying on.
+    `applied` maps checksum -> (key, version, path) from the history table. A file that moved keeps its checksum, so it
+    is recognised wherever it now lives. What still fails is an applied migration that was **edited** (its key and
+    version are still there, with different content) or **deleted** (neither its content nor its key and version).
     """
+    by_checksum = {m.checksum: m for m in migrations}
     by_id = {(m.key, m.version): m for m in migrations}
     problems = []
-    for (key, version), (path, checksum) in sorted(applied.items()):
-        migration = by_id.get((key, version))
-        if migration is None:
-            problems.append(f"{path} was applied but its file is gone")
-        elif migration.path != path:
-            problems.append(f"{key} v{version:03d} was applied as {path} but the file is now {migration.path}")
-        elif migration.checksum != checksum:
-            problems.append(f"{path} changed after it was applied; write a new version instead of editing it")
+    for checksum, (key, version, path) in sorted(applied.items(), key=lambda item: item[1]):
+        if checksum in by_checksum:
+            continue
+        if (key, version) in by_id:
+            problems.append(f"{by_id[(key, version)].path} changed after it was applied; write a new version instead of editing it")
+        else:
+            problems.append(f"{path} was applied but is gone: no file has its content, and {key} v{version:03d} no longer exists")
     if problems:
         raise ValueError("migration history doesn't match the ddl/ folders:\n  " + "\n  ".join(problems))
-    return [m for m in migrations if (m.key, m.version) not in applied]
+    return [m for m in migrations if m.checksum not in applied]
+
+
+def moved_migrations(migrations: list[Migration], applied: dict[str, tuple[str, int, str]]) -> list[Migration]:
+    """Applied migrations whose file has moved or been renumbered, so the history can be refreshed."""
+    return [m for m in migrations if m.checksum in applied and applied[m.checksum] != (m.key, m.version, m.path)]
 
 
 def render(sql: str, values: dict[str, str]) -> str:
@@ -213,4 +185,4 @@ def render_bronze_migration(target: str, source_table: str, mode: str, columns: 
         + "\n)\n"
         f"COMMENT 'Raw {source_table}, loaded in {mode} mode, one _batch_id per load';\n"
     )
-    return f"00_bronze/ddl/bronze_{target}_v001_create.sql", sql
+    return f"00_bronze/ddl/{target}/v001_create.sql", sql

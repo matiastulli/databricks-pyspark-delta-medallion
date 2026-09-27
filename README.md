@@ -64,7 +64,8 @@ flowchart LR
 - Proven by breaking it on purpose: a gold date deleted by hand made reconciliation fail (`got 21475, expected 21833`), the run failed, and gold came back at its pre-run values.
 
 **Tables as code: DDL migrations**
-- **Jobs never create tables.** Every published table is defined by write-once SQL in its schema's folder, e.g. `src/01_silver/ddl/silver_trips_v001_create.sql`, then `silver_trips_v002_alter.sql`. Versions are counted per table, and the `apply_ddl` workflow applies the pending ones and records them in `ops.schema_migrations`.
+- **Jobs never create tables.** Every published table has its own folder of write-once SQL, named as the table is called now: `src/01_silver/ddl/trips/v001_create.sql`, `v002_alter.sql`, `v003_alter.sql`. The `apply_ddl` workflow applies the pending ones and records them in `ops.schema_migrations`.
+- **A migration is identified by the checksum of its content, not its path**, so renaming a table (its folder, and the renumbering that follows) re-applies nothing: a rename is just another version inside the folder, and the whole history of a table stays in one place.
 - **A small in-repo runner** ([`migrations.py`](src/medallion/migrations.py), unit-tested): schemas first, then layer folders, tables and versions, with renames after the table they rename. It refuses an applied migration that was edited or deleted, and misplaced, misnamed, duplicate or missing versions.
 - **Adopted without rewriting anything:** the baseline migrations reproduce the 12 existing tables exactly (117 columns: types, `NOT NULL`, comments; checked against a fresh catalog). Applying them left every table's Delta version and row count unchanged.
 - **A naming convention, applied through migrations:** bronze `<source_system>_<source_table>` (derived from the config), silver plural entities, gold `fct_` / `dim_` / `agg_<subject>_<grain>`. Three tables were renamed with `ALTER TABLE … RENAME TO`, and their data, history and comments moved with them.
@@ -97,7 +98,7 @@ flowchart LR
 
 **Tests and CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml))
 - **Thin notebooks, tested logic:** all transformations live in [`src/medallion/`](src/medallion) as pure DataFrame functions. The notebooks only read, call, write and orchestrate.
-- **62 pytest tests** on local PySpark, with no workspace: key stability, first load wins, the silver/quarantine split, typing, aggregates, quality checks, edge cases (nulls, empty inputs), the write contract, the migration runner (order, drift, naming), and validation of the sources config. One edge-case test caught a real bug: a trip with a null value passed validation, because `null <= 0` is null, not true.
+- **60 pytest tests** on local PySpark, with no workspace: key stability, first load wins, the silver/quarantine split, typing, aggregates, quality checks, edge cases (nulls, empty inputs), the write contract, the migration runner (order, drift, naming), and validation of the sources config. One edge-case test caught a real bug: a trip with a null value passed validation, because `null <= 0` is null, not true.
 - **CI on GitHub, CD from the laptop:** every push runs the tests. Deploys are `databricks bundle deploy` with OAuth, so GitHub holds no Databricks credentials.
 
 ## Project structure
@@ -116,17 +117,17 @@ flowchart LR
 │   │   ├── ingest.py             one generic notebook for every table source
 │   │   ├── ingest_files.py       Auto Loader: files from the landing volume
 │   │   ├── seed_landing_files.py drops JSON files in the volume, standing in for an external system
-│   │   └── ddl/                  schemas_v001_create.sql, bronze_<table>_v001_create.sql, …_v001_rename.sql
+│   │   └── ddl/                  one folder per table: schemas/, nyctaxi_trips/, tpch_orders/, landing/ …
 │   ├── 01_silver/
 │   │   ├── clean_trips.py
-│   │   └── ddl/                  silver_trips_v001_create.sql, …
+│   │   └── ddl/                  trips/, trips_quarantine/
 │   ├── 02_gold/
 │   │   ├── build_trip_metrics.py  incremental from silver's change feed
-│   │   └── ddl/                  gold_…_v001_create.sql, …_to_agg_…_v001_rename.sql
+│   │   └── ddl/                  agg_trips_daily/, agg_trips_by_pickup_zip/
 │   ├── ops/
 │   │   ├── apply_ddl.py          the migration runner
 │   │   ├── maintain_tables.py    OPTIMIZE / REORG / VACUUM, weekly
-│   │   └── ddl/                  ops_processed_versions_v001_create.sql
+│   │   └── ddl/                  processed_versions/
 │   └── medallion/                sources, bronze, silver, gold, quality, contract, migrations, maintenance: the tested logic
 ├── tests/                        pytest on local PySpark
 ├── scripts/
@@ -218,7 +219,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)               # only needed for
 | `.venv/bin/python scripts/measure_pruning.py "<query>"` | Files read vs pruned for a query, from query history |
 | `.venv/bin/python scripts/new_bronze_migration.py <name>` | Generate a bronze table's `…_v001_create.sql` from its source schema (`--dry-run` prints it) |
 
-Change a table by adding its next version, e.g. `src/02_gold/ddl/gold_agg_trips_daily_v002_alter.sql`. **Never edit an applied migration:** the runner refuses to continue until the file matches what ran.
+Change a table by adding the next version to its folder, e.g. `src/02_gold/ddl/agg_trips_daily/v003_alter.sql`. **Never edit an applied migration:** the runner refuses to continue until the file matches what ran.
 
 ### Jobs and runs
 
@@ -257,7 +258,7 @@ Useful in the SQL editor: `DESCRIBE HISTORY medallion.01_silver.trips` (what eac
 ## Tests
 
 ```sh
-.venv/bin/pytest                                     # all 62 tests, ~7 s
+.venv/bin/pytest                                     # all 60 tests, ~7 s
 .venv/bin/pytest tests/test_silver.py                # one file
 .venv/bin/pytest -k time_zone                        # by name
 ```

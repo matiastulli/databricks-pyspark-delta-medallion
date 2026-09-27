@@ -3,7 +3,7 @@
 
 Adding a bronze source is two steps: add its entry to config/sources.toml, then run this script. It reads the source
 table's columns on the SQL warehouse (DESCRIBE TABLE), adds the ingestion metadata columns, and writes
-src/00_bronze/ddl/bronze_<name>_v001_create.sql for review.
+src/00_bronze/ddl/<name>/v001_create.sql for review.
 
 Usage (after `databricks auth login`, from the repo root):
     .venv/bin/python scripts/new_bronze_migration.py tpch_lineitem            # writes the migration
@@ -70,7 +70,8 @@ def main() -> None:
         return
     target = SRC_DIR / path
     if target.exists():
-        sys.exit(f"{target.relative_to(REPO_ROOT)} already exists; change an existing table with a new alter_..._v<NNN>.sql instead")
+        sys.exit(f"{target.relative_to(REPO_ROOT)} already exists; change an existing table with a new v<NNN>_alter.sql in its folder instead")
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(sql)
     print(f"wrote {target.relative_to(REPO_ROOT)}; review it, then `databricks bundle run apply_ddl`")
 

@@ -3,12 +3,14 @@
 # MAGIC # Apply DDL migrations
 # MAGIC
 # MAGIC Tables are created and changed only here, never by the jobs that write to them. This notebook applies the
-# MAGIC write-once SQL files in `src/<NN_layer>/ddl/` that haven't run yet and records each one in
-# MAGIC `<catalog>.ops.schema_migrations`. Every table has its own version sequence (`silver_trips_v001_create.sql`,
-# MAGIC `silver_trips_v002_alter.sql`, …).
+# MAGIC write-once SQL files in `src/<NN_layer>/ddl/<table>/` that haven't run yet and records each one in
+# MAGIC `<catalog>.ops.schema_migrations`. Each table has one folder, named as the table is called now, holding its whole
+# MAGIC history: `v001_create.sql`, `v002_rename.sql`, `v003_alter.sql`, …
 # MAGIC
-# MAGIC **Run order:** `schemas` first, then layer folders (00, 01, 02), tables by name, each table's versions ascending,
-# MAGIC and a renamed table always after the table it renames.
+# MAGIC **Run order:** `schemas` first, then layer folders (00, 01, 02, then ops), tables by name, versions ascending.
+# MAGIC
+# MAGIC **A migration is identified by the checksum of its content, not by its path**, so renaming a table (which moves
+# MAGIC and renumbers its files) doesn't re-apply anything: the history rows are refreshed instead.
 # MAGIC
 # MAGIC - **Reruns do nothing:** applied versions are skipped.
 # MAGIC - **Applied migrations are write-once:** if one was edited, renamed or deleted since it ran, the run fails before
@@ -35,7 +37,7 @@ dbutils.widgets.text("silver_schema", "01_silver")
 dbutils.widgets.text("gold_schema", "02_gold")
 dbutils.widgets.dropdown("dry_run", "false", ["true", "false"])
 
-from medallion.migrations import HISTORY_SCHEMA, HISTORY_TABLE, PLACEHOLDERS, load_migrations, pending_migrations, render, split_statements
+from medallion.migrations import HISTORY_SCHEMA, HISTORY_TABLE, PLACEHOLDERS, load_migrations, moved_migrations, pending_migrations, render, split_statements
 
 values = {name: dbutils.widgets.get(name) for name in PLACEHOLDERS}
 dry_run = dbutils.widgets.get("dry_run") == "true"
@@ -59,9 +61,19 @@ COMMENT 'DDL migrations applied from src/<NN_layer>/ddl by src/ops/apply_ddl.py'
 """)
 
 migrations = load_migrations()
-applied = {(row.migration, row.version): (row.file, row.checksum) for row in spark.table(history_table).collect()}
+applied = {row.checksum: (row.migration, row.version, row.file) for row in spark.table(history_table).collect()}
 pending = pending_migrations(migrations, applied)
-print(f"{len(migrations)} migrations, {len(applied)} already applied, {len(pending)} pending" + (" (dry run)" if dry_run else ""))
+moved = moved_migrations(migrations, applied)
+print(f"{len(migrations)} migrations, {len(applied)} already applied, {len(pending)} pending, {len(moved)} moved" + (" (dry run)" if dry_run else ""))
+
+# A moved file is the same migration in a new place (a renamed table, a renumbered version). Nothing is re-applied;
+# the history just learns where it lives now.
+for migration in [] if dry_run else moved:
+    print(f"   moved: {applied[migration.checksum][2]} -> {migration.path}")
+    spark.sql(
+        f"UPDATE {history_table} SET migration = '{migration.key}', version = {migration.version}, file = '{migration.path}' "
+        f"WHERE checksum = '{migration.checksum}'"
+    )
 
 # COMMAND ----------
 
@@ -84,6 +96,6 @@ for migration in pending:
         .append()
     )
 
-summary = {"catalog": catalog, "dry_run": dry_run, "already_applied": len(applied), "applied_now": [] if dry_run else [m.path for m in pending], "pending": [m.path for m in pending] if dry_run else []}
+summary = {"catalog": catalog, "dry_run": dry_run, "already_applied": len(applied), "moved": [m.path for m in moved], "applied_now": [] if dry_run else [m.path for m in pending], "pending": [m.path for m in pending] if dry_run else []}
 print(summary)
 dbutils.notebook.exit(json.dumps(summary))

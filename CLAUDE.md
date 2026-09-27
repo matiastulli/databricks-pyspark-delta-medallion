@@ -17,10 +17,11 @@ Learning path. `docs/PLAN.md` is the only place that tracks it: update its statu
 5. CI/CD + orchestration, thin and early: high-risk logic as pure functions in `src/` with a few pytest tests, GitHub Actions, and a Databricks Asset Bundle (`databricks.yml`) job running bronze → silver → gold for real
 6. Scale out: generic `00_bronze/ingest.py` driven by `config/sources.toml` (nyctaxi + TPC-H), one generated, scheduled job per source, and silver/gold jobs on table update triggers; `src/` folders per schema, notebooks named by process
 7. Complete tests: the remaining transformations and edge cases
-8. Table DDL as versioned migrations (`src/<NN_layer>/ddl/<layer>_<table>_v<NNN>_<verb>.sql`, versioned per table; renames `<layer>_<old>_to_<new>_v001_rename.sql`; applied by the `apply_ddl` workflow), so jobs stop creating tables. **DDL holds only final (published) tables.** Intermediates inside one transformation (DataFrames, temp views, CTEs, or a `_tmp_` table created and dropped within a run) never go in the `ddl/` folders. In-repo migration runner; schemas created by a migration (not the bundle `schema` resource: dev mode renames it to `dev_<user>_<name>` and `bundle destroy` drops it with its data, tested). Table naming convention in `docs/PLAN.md` step 8: bronze `<source_system>_<source_table>`, silver plural `<entity>` + `<entity>_quarantine`, gold `fct_`/`dim_`/`agg_<subject>_<grain>`, temp `_tmp_<process>_<purpose>`, no layer in table names. Done
+8. Table DDL as versioned migrations (`src/<NN_layer>/ddl/<table>/v<NNN>_<verb>.sql` since step 12: one folder per table, applied by the `apply_ddl` workflow), so jobs stop creating tables. **DDL holds only final (published) tables.** Intermediates inside one transformation (DataFrames, temp views, CTEs, or a `_tmp_` table created and dropped within a run) never go in the `ddl/` folders. In-repo migration runner; schemas created by a migration (not the bundle `schema` resource: dev mode renames it to `dev_<user>_<name>` and `bundle destroy` drops it with its data, tested). Table naming convention in `docs/PLAN.md` step 8: bronze `<source_system>_<source_table>`, silver plural `<entity>` + `<entity>_quarantine`, gold `fct_`/`dim_`/`agg_<subject>_<grain>`, temp `_tmp_<process>_<purpose>`, no layer in table names. Done
 9. Delta layout + maintenance: liquid clustering and table properties (`optimizeWrite`, `autoCompact`) through migrations, and a `maintain_tables` workflow (`OPTIMIZE`, `REORG … APPLY (PURGE)`, `VACUUM`), with before/after measurements. Z-order and partitioning are deliberately out (see `docs/PLAN.md` step 9). Note: deletion vectors are on by default and **predictive optimization already runs `OPTIMIZE`** on these tables, so this step demonstrates and measures rather than fixes
 10. Auto Loader: file ingestion from the `landing` UC volume with `availableNow` and a checkpoint; `config/sources.toml` gains `kind` (`table` | `files`)
 11. Change Data Feed: `agg_trips_daily` is built incrementally from silver's change feed with a watermark in `ops.processed_versions`; the ZIP ranking stays a full rebuild because a rank depends on every row
+12. One folder per table in `ddl/`, named as the table is called now, so a renamed table's whole history stays in one place; migrations are identified by checksum, not path
 
 
 ## Environment
@@ -56,7 +57,7 @@ databricks bundle run apply_ddl                              # apply pending mig
 databricks bundle run ingest_nyctaxi_trips                   # any ingest_<source>; prints the notebook's exit JSON
 databricks bundle run seed_landing_files --params days=5     # drop JSON files in the landing volume (dates already written are left alone)
 databricks bundle run ingest_landing_trips                   # Auto Loader: only files it hasn't seen; a rerun ingests 0 rows
-.venv/bin/python scripts/new_bronze_migration.py <name>      # generate src/00_bronze/ddl/bronze_<name>_v001_create.sql from the source schema (--dry-run prints)
+.venv/bin/python scripts/new_bronze_migration.py <name>      # generate src/00_bronze/ddl/<name>/v001_create.sql from the source schema (--dry-run prints)
 databricks bundle run clean_trips                            # must report rows_inserted: 0 on reruns
 databricks bundle run build_trip_metrics                     # incremental from silver's change feed; fails with DataQualityError if a check fails
 databricks bundle run build_trip_metrics --params full_rebuild=true   # ignore the watermark and rebuild every date
@@ -106,9 +107,9 @@ Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no
 
 **Tables are code (step 8).**
 - Jobs never create, comment on or redefine tables. They check that the table exists, run `raise_if_schema_mismatch`, then write with `writeTo(...).append()` / `.overwrite(F.lit(True))` or `MERGE`. Never use `saveAsTable`, `overwriteSchema` or `mergeSchema` in jobs.
-- Every published table has DDL in `src/<NN_layer>/ddl/`: `<layer>_<table>_v<NNN>_<create|alter|rename|drop>.sql`, versioned per table, with `${catalog}` / `${bronze_schema}` / `${silver_schema}` / `${gold_schema}` placeholders. Schemas are in `00_bronze/ddl/schemas_v<NNN>_<verb>.sql`.
-- A rename starts the new table's history (`<layer>_<old>_to_<new>_v001_rename.sql`) and runs after the old table's migrations.
-- **Never edit an applied migration.** Add the next version instead. `apply_ddl` refuses any drift (checksum), a missing file, or a moved file.
+- Every published table has **its own folder**: `src/<NN_layer>/ddl/<table>/v<NNN>_<create|alter|rename|drop>.sql`, named as the table is called now, with `${catalog}` / `${bronze_schema}` / `${silver_schema}` / `${gold_schema}` placeholders. The schemas live in `00_bronze/ddl/schemas/`, tooling tables in `src/ops/ddl/<table>/` (applied last).
+- **A rename is just another version of the same table** (`v002_rename.sql` inside its folder), and the folder is renamed to the table's new name, so a table's whole history stays in one place. Version numbers stay contiguous across a rename.
+- **Never edit an applied migration.** Add the next version instead. A migration's identity is the **checksum of its content**, not its path, so moving or renumbering files is free and `apply_ddl` refreshes the recorded paths itself. Editing or deleting an applied migration still fails the run.
 - History lives in `<catalog>.ops.schema_migrations` (migration, version, file, checksum, applied_at), created by the runner itself.
 - Intermediates (DataFrames, temp views, `_tmp_*` tables dropped within a run) never get DDL.
 - Naming convention: bronze `<source_system>_<source_table>`, silver plural `<entity>` + `<entity>_quarantine`, gold `fct_` / `dim_` / `agg_<subject>_<grain>`, and no layer in table names. The full convention, including columns, is in `docs/PLAN.md` step 8.
@@ -127,7 +128,7 @@ Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no
 - The ZIP ranking is rebuilt in full on purpose: a rank depends on every row.
 - Incremental runs can only check *after* writing, so the job notes gold's version first and runs `RESTORE TABLE … TO VERSION AS OF` if a check fails. The watermark moves only after the checks pass.
 - **Serverless retries a failed task automatically** (verified: two attempts, each rolling itself back). Anything that writes must be safe to run twice.
-- `ops` migrations live in `src/ops/ddl/` (`ops_<table>_v<NNN>_<verb>.sql`) and run after the layer folders.
+- `ops` migrations live in `src/ops/ddl/<table>/` and run after the layer folders.
 
 ## Working agreements
 
