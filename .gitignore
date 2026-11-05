@@ -15,3 +15,6 @@ derby.log
 # Secrets / OS
 .env
 .DS_Store
+
+# Claude Code local settings and macOS
+.claude/settings.local.json
