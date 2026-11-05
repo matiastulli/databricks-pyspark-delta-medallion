@@ -138,6 +138,10 @@ Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no
 - The user's GitHub profile README (`~/Code/matiastulli`) lists this project. Update its entry as the project progresses, and pull before editing because the user also edits it on the web.
 - Add commands to this file as each step introduces them. Don't document commands that don't exist yet.
 
+## Checks
+
+Before saying a step is done: `.venv/bin/pytest` (with `JAVA_HOME` on Java 17) and `databricks bundle validate`. The learning path is tracked in `docs/PLAN.md`, not in `docs/plans/`.
+
 ## Agents
 
 `.claude/agents/reviewer.md` and `security.md` hold this repo's review checklist and leak checks; they override the global agents of the same name in `~/.claude`. Every repo keeps these two and no others.
