@@ -26,6 +26,9 @@ resources:
         # Ignore the watermark and rebuild every date from silver, e.g. after changing an aggregation.
         - name: full_rebuild
           default: "false"
+        # Filled in by Databricks at run time, so the check results in ops.check_results join to this run.
+        - name: run_id
+          default: "{{job.run_id}}"
 
       tasks:
         - task_key: build_trip_metrics

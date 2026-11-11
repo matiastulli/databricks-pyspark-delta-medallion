@@ -12,6 +12,9 @@
 #             "overwrite" every run replaces the table with a full snapshot (reference data, flat storage)
 #   schedule  Quartz cron (seconds minutes hours day-of-month month day-of-week), UTC.
 #             In the dev target every schedule is paused, so jobs only run when started by hand.
+#   max_age_hours  optional. monitor_pipeline fails when the newest row in the bronze table (its _ingested_at) is
+#             older than this: the schedule's interval plus some slack. Written by hand rather than derived from the
+#             cron, because parsing Quartz cron would need a dependency. Without it, the source isn't checked.
 #
 # The cadences are illustrative: the sample tables don't actually change.
 
@@ -20,6 +23,7 @@ kind = "table"
 table = "samples.nyctaxi.trips"
 mode = "append"
 schedule = "0 0 5 * * ?"            # daily at 05:00
+max_age_hours = 26
 
 # TPC-H: related reference tables, re-delivered whole, so each run replaces the previous snapshot.
 # samples.tpch.lineitem (30M rows) is left out on purpose to protect Free Edition quota.
@@ -29,42 +33,49 @@ kind = "table"
 table = "samples.tpch.region"
 mode = "overwrite"
 schedule = "0 0 6 1 * ?"            # monthly, on the 1st at 06:00
+max_age_hours = 768
 
 [[sources]]
 kind = "table"
 table = "samples.tpch.nation"
 mode = "overwrite"
 schedule = "0 0 6 1 * ?"            # monthly, on the 1st at 06:00
+max_age_hours = 768
 
 [[sources]]
 kind = "table"
 table = "samples.tpch.supplier"
 mode = "overwrite"
 schedule = "0 0 6 1,15 * ?"         # twice a month, on the 1st and 15th (Quartz has no "every 14 days")
+max_age_hours = 408
 
 [[sources]]
 kind = "table"
 table = "samples.tpch.part"
 mode = "overwrite"
 schedule = "0 0 6 1,15 * ?"         # twice a month, on the 1st and 15th
+max_age_hours = 408
 
 [[sources]]
 kind = "table"
 table = "samples.tpch.partsupp"
 mode = "overwrite"
 schedule = "0 0 6 1,15 * ?"         # twice a month, on the 1st and 15th
+max_age_hours = 408
 
 [[sources]]
 kind = "table"
 table = "samples.tpch.customer"
 mode = "overwrite"
 schedule = "0 30 6 * * ?"           # daily at 06:30
+max_age_hours = 26
 
 [[sources]]
 kind = "table"
 table = "samples.tpch.orders"
 mode = "overwrite"
 schedule = "0 30 6 * * ?"           # daily at 06:30
+max_age_hours = 26
 
 # Files landing in a volume, read incrementally by Auto Loader with its own checkpoint. The seed_landing_files job
 # writes them; in a real setup another system would drop them there.

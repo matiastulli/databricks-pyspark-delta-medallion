@@ -47,7 +47,7 @@ flowchart LR
 | Bronze | `src/00_bronze/` | `medallion.00_bronze` | Sources copied as is, plus `_batch_id`, `_ingested_at`, `_source_table`, `_source_file`. Tables are copied in full; files in the `landing` volume are picked up incrementally by Auto Loader |
 | Silver | `src/01_silver/` | `medallion.01_silver` | `trips`: deduplicated, validated, typed; `trips_quarantine`: rejected trips with their reasons |
 | Gold | `src/02_gold/` | `medallion.02_gold` | `agg_trips_daily` (built incrementally from silver's change feed), `agg_trips_by_pickup_zip` (a ranking, rebuilt in full) |
-| Ops | `src/ops/` | `medallion.ops` | `apply_ddl` applies DDL migrations and records them in `schema_migrations`; `maintain_tables` runs the weekly `OPTIMIZE` / `VACUUM`; `processed_versions` holds the incremental watermarks |
+| Ops | `src/ops/` | `medallion.ops` | `apply_ddl` applies DDL migrations and records them in `schema_migrations`; `maintain_tables` runs the weekly `OPTIMIZE` / `VACUUM`; `processed_versions` holds the incremental watermarks; `monitor_pipeline` and gold record every health check in `check_results` |
 
 ## What this project shows
 
@@ -62,6 +62,11 @@ flowchart LR
 - **Compute → check → write** for a full rebuild: the 13 checks run before anything is published (silver's contract, one row per key, and **reconciliation** of trips and revenue with silver).
 - **Write → check → roll back** for an incremental merge, because the result only exists once merged: the job notes gold's version, merges, checks, and on failure runs `RESTORE TABLE … TO VERSION AS OF`. Either way a bad aggregate never stays published, and the watermark only moves after the checks pass.
 - Proven by breaking it on purpose: a gold date deleted by hand made reconciliation fail (`got 21475, expected 21833`), the run failed, and gold came back at its pre-run values.
+
+**Observability**
+- **Every job alerts on failure and on long runs,** with a timeout, from one bundle **mutator** ([`resources/__init__.py`](resources/__init__.py)) that runs on YAML and generated jobs alike, so a new job can't forget it. The address is a bundle variable from `.env`, never committed.
+- **Every check result is kept** in `ops.check_results`, append-only (`delta.appendOnly`, which makes Delta refuse `UPDATE` and `DELETE`), and written *before* a failing run raises (gold restores its table first, so recording can't get in the way of the rollback). Each row carries its job `run_id`, so it joins to the run in `system.lakeflow`.
+- **A daily [`monitor_pipeline`](resources/monitor_pipeline_job.yml)** checks freshness (each bronze table's newest `_ingested_at` against `max_age_hours` in the config) and the quarantine rate, and fails, which sends the email, if one fails. Proven by lowering the threshold below today's 0.39%: the run failed with its results on record. The write is an insert-only `MERGE` on `(job, run_id, check_name)`, because serverless retries a failed task and the first version, a plain append, recorded every check twice.
 
 **Tables as code: DDL migrations**
 - **Jobs never create tables.** Every published table has write-once SQL files next to the process that writes it, named as the table is called now: `src/01_silver/trips/ddl_trips_v001_create.sql`, `ddl_trips_v002_alter.sql`, `ddl_trips_v003_alter.sql`. The `apply_ddl` workflow applies the pending ones and records them in `ops.schema_migrations`.
@@ -91,25 +96,26 @@ flowchart LR
 - **The schema comes from the target table**, not from inference, so a file that stops matching the DDL fails the run instead of changing the table.
 
 **Databricks workflows as code** ([`databricks.yml`](databricks.yml), [`resources/`](resources))
-- **One workflow per process:** eight `ingest_<source>` jobs (daily, twice a month, monthly), `clean_trips` (silver) and `build_trip_metrics` (the gold scorecard).
+- **One workflow per process:** eight `ingest_<source>` jobs (daily, twice a month, monthly), `clean_trips` (silver), `build_trip_metrics` (the gold scorecard) and `monitor_pipeline` (health checks).
 - **Generated jobs:** [`resources/__init__.py`](resources/__init__.py) uses Python-defined bundle resources to create one ingestion job per entry in [`config/sources.toml`](config/sources.toml). Adding bronze table #41 is a config entry: no notebook, no job YAML.
 - **Event-driven downstream:** silver and gold start on **table update triggers** on their input tables, instead of guessing when bronze finished. Triggers fire only on real data changes, so a silver run that inserts nothing doesn't rebuild gold.
 - **Safe dev target:** development mode prefixes job names with the user and pauses every schedule and trigger, so nothing spends Free Edition quota on its own.
 
 **Tests and CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml))
 - **Thin notebooks, tested logic:** all transformations live in [`src/medallion/`](src/medallion) as pure DataFrame functions. The notebooks only read, call, write and orchestrate.
-- **60 pytest tests** on local PySpark, with no workspace: key stability, first load wins, the silver/quarantine split, typing, aggregates, quality checks, edge cases (nulls, empty inputs), the write contract, the migration runner (order, drift, naming), and validation of the sources config. One edge-case test caught a real bug: a trip with a null value passed validation, because `null <= 0` is null, not true.
+- **76 pytest tests** on local PySpark, with no workspace: key stability, first load wins, the silver/quarantine split, typing, aggregates, quality checks, edge cases (nulls, empty inputs), the write contract, the migration runner (order, drift, naming), and validation of the sources config. One edge-case test caught a real bug: a trip with a null value passed validation, because `null <= 0` is null, not true.
 - **CI on GitHub, CD from the laptop:** every push runs the tests. Deploys are `databricks bundle deploy` with OAuth, so GitHub holds no Databricks credentials.
 
 ## Project structure
 
 ```
 ├── config/
-│   └── sources.toml              bronze sources: kind (table | files), load mode, schedule
+│   └── sources.toml              bronze sources: kind (table | files), load mode, schedule, max_age_hours
 ├── resources/
-│   ├── __init__.py               generates one ingest_<source> job per config entry
+│   ├── __init__.py               generates one ingest_<source> job per config entry, and adds alerting to every job
 │   ├── apply_ddl_job.yml         applies pending DDL migrations
 │   ├── maintain_tables_job.yml   weekly Delta maintenance
+│   ├── monitor_pipeline_job.yml  daily health checks (freshness, quarantine rate)
 │   ├── clean_trips_job.yml       silver workflow (table update trigger)
 │   └── build_trip_metrics_job.yml  gold scorecard workflow (table update trigger)
 ├── src/
@@ -126,10 +132,12 @@ flowchart LR
 │   ├── ops/
 │   │   ├── schema_migrations/    notebook_apply_ddl.py: the migration runner (it creates its own history table)
 │   │   ├── processed_versions/   ddl_processed_versions_v001_create.sql: gold's change-feed watermark
+│   │   ├── check_results/        ddl_check_results_v001_create.sql: every health check's result, append-only
+│   │   ├── _monitoring/          notebook_monitor_pipeline.py: freshness and quarantine checks
 │   │   └── _maintenance/         notebook_maintain_tables.py: OPTIMIZE / REORG / VACUUM over every table
 │   ├── tools/
 │   │   └── landing/              notebook_seed_landing_files.py: drops JSON files in the volume, standing in for an external system
-│   └── medallion/                sources, bronze, silver, gold, quality, contract, migrations, maintenance: the tested logic
+│   └── medallion/                sources, bronze, silver, gold, quality, contract, migrations, maintenance, observability: the tested logic
 ├── tests/                        pytest on local PySpark
 ├── scripts/
 │   ├── setup_unity_catalog.sh    the catalog (one-off)
@@ -155,7 +163,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Workspace settings: copy the template and set DATABRICKS_HOST (.env is gitignored)
+# 2. Workspace settings: copy the template and set DATABRICKS_HOST and BUNDLE_VAR_alert_email (.env is gitignored)
 cp .env.example .env
 set -a; source .env; set +a
 
@@ -217,6 +225,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 17)               # only needed for
 | `databricks bundle run seed_landing_files --params days=5` | Drop JSON files in the landing volume; dates already written are left alone |
 | `databricks bundle run ingest_landing_trips` | Auto Loader: ingests only files it hasn't seen; a rerun ingests 0 rows |
 | `databricks bundle run maintain_tables` | `OPTIMIZE` + `VACUUM` dry run over every table; `--params optimize_full=true` re-clusters, `vacuum=run` really deletes |
+| `databricks bundle run monitor_pipeline` | Freshness and quarantine checks into `ops.check_results`; fails, and emails, if one fails |
 | `.venv/bin/python scripts/measure_pruning.py "<query>"` | Files read vs pruned for a query, from query history |
 | `.venv/bin/python scripts/new_bronze_migration.py <name>` | Generate a bronze table's `…_v001_create.sql` from its source schema (`--dry-run` prints it) |
 
