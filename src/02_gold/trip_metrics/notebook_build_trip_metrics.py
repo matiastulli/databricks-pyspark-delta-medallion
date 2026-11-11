@@ -38,6 +38,7 @@ dbutils.widgets.text("catalog", "medallion")
 dbutils.widgets.text("silver_schema", "01_silver")
 dbutils.widgets.text("gold_schema", "02_gold")
 dbutils.widgets.dropdown("full_rebuild", "false", ["true", "false"])
+dbutils.widgets.text("run_id", "")
 
 catalog = dbutils.widgets.get("catalog")
 silver_table = f"`{catalog}`.`{dbutils.widgets.get('silver_schema')}`.trips"
@@ -45,10 +46,11 @@ gold_schema = f"`{catalog}`.`{dbutils.widgets.get('gold_schema')}`"
 daily_trips_table = f"{gold_schema}.agg_trips_daily"
 busiest_pickup_zones_table = f"{gold_schema}.agg_trips_by_pickup_zip"
 watermarks_table = f"`{catalog}`.ops.processed_versions"
+check_results_table = f"`{catalog}`.ops.check_results"
 PROCESS = "build_trip_metrics"
 
 # Tables are created only by DDL migrations (the apply_ddl job), never here.
-for table in [daily_trips_table, busiest_pickup_zones_table, watermarks_table]:
+for table in [daily_trips_table, busiest_pickup_zones_table, watermarks_table, check_results_table]:
     if not spark.catalog.tableExists(table):
         raise RuntimeError(f"{table} doesn't exist: run `databricks bundle run apply_ddl` first")
 
@@ -146,17 +148,33 @@ busiest_pickup_zones.writeTo(busiest_pickup_zones_table).overwrite(F.lit(True))
 # MAGIC what catches an incremental run that drifted: a date it should have rebuilt and didn't shows up as a mismatch.
 # MAGIC
 # MAGIC The tables are already written at this point, so a failure restores `agg_trips_daily` to the version from before
-# MAGIC this run and then fails the run.
+# MAGIC this run, every result is recorded in `ops.check_results` (passed or not, so a failure is still on record once
+# MAGIC the run is gone), and then the run fails. Restoring comes first, so a problem while recording can't skip it.
 
 # COMMAND ----------
+
+from medallion.observability import CHECK_RESULT_SCHEMA, check_result_rows
 
 results = gold_checks(silver, spark.table(daily_trips_table), spark.table(busiest_pickup_zones_table))
 for result in results:
     print(("PASS " if result["passed"] else "FAIL ") + result["check"] + ("" if result["passed"] else f": got {result['actual']}, expected {result['expected']}"))
 
+# Roll back first, so nothing that goes wrong while recording can leave a failed aggregate published.
 if any(not result["passed"] for result in results):
     spark.sql(f"RESTORE TABLE {daily_trips_table} TO VERSION AS OF {gold_version_before}")
     print(f"restored {daily_trips_table} to version {gold_version_before}")
+
+# Then record, passed or not. Insert-only MERGE on (job, run_id, check_name): serverless retries a failed task, and the
+# retry must not record the same checks twice. A null run_id (an interactive run) never matches, so it always records.
+check_rows = spark.createDataFrame(check_result_rows(results, PROCESS, dbutils.widgets.get("run_id")), CHECK_RESULT_SCHEMA).withColumn("checked_at", F.current_timestamp())
+raise_if_schema_mismatch(check_rows.dtypes, spark.table(check_results_table).dtypes, check_results_table)
+(
+    DeltaTable.forName(spark, check_results_table).alias("target")
+    .merge(check_rows.alias("source"), "target.job = source.job AND target.run_id = source.run_id AND target.check_name = source.check_name")
+    .whenNotMatchedInsertAll()
+    .execute()
+)
+
 raise_if_any_failed(results)
 
 # COMMAND ----------

@@ -20,6 +20,9 @@ python:
   venv_path: .venv
   resources:
     - "resources:load_resources"
+  # Applied to every job after they're all loaded, YAML and generated alike: failure and duration alerts.
+  mutators:
+    - "resources:add_alerting"
 
 # Override any of these per run with --var, e.g. --var catalog=my_catalog, or with BUNDLE_VAR_catalog.
 variables:
@@ -32,6 +35,10 @@ variables:
     default: 01_silver
   gold_schema:
     default: 02_gold
+  # No default on purpose: this repo is public, so the address comes from BUNDLE_VAR_alert_email in .env, and a deploy
+  # without it fails instead of sending alerts nowhere.
+  alert_email:
+    description: Address that gets an email when any job fails or runs long
 
 targets:
   dev:

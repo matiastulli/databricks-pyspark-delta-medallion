@@ -22,13 +22,14 @@ Learning path. `docs/PLAN.md` is the only place that tracks it: update its statu
 12. One folder per table in `ddl/`, named as the table is called now, so a renamed table's whole history stays in one place; migrations are identified by checksum, not path
 13. Folders say what they hold: `notebooks/` next to `ddl/` in every `src/` folder, and the seed helper in `src/tools/` (layout superseded by step 14)
 14. Folders by process, like the AWS sibling repo: one folder per process holding its `notebook_<process>.py` and the `ddl_<table>_v<NNN>_<verb>.sql` of the tables it writes; `_`-prefixed folders for generic code (`00_bronze/_ingestion/`, `ops/_maintenance/`)
+15. Observability: failure alerts on every job (a `job_mutator`), run history as a view over `system.lakeflow`, and health checks (freshness, quarantine rate, gold quality) in one append-only `ops.check_results`, written by a `monitor_pipeline` job. Complements the dbt repo's hand-built run log instead of copying it
 
 
 ## Environment
 
 - Databricks **Free Edition**: serverless compute only, with usage limits. If a step doesn't fit, adapt the step rather than suggest a paid plan.
 - Databricks CLI (Homebrew). Authenticate with `databricks auth login` (browser OAuth). **Never ask for or handle personal access tokens in chat.** The CLI uses the `DEFAULT` profile in `~/.databrickscfg`. Keep the workspace host out of committed files.
-- Workspace-specific settings (`DATABRICKS_HOST`, `DATABRICKS_CONFIG_PROFILE`, `DATABRICKS_WAREHOUSE_ID`) and the catalog/schema names live in `.env`, which is git-ignored. `.env.example` is the committed template. Add new variables to both files, and only when code uses them. Never put tokens in `.env`, because auth is OAuth.
+- Workspace-specific settings (`DATABRICKS_HOST`, `DATABRICKS_CONFIG_PROFILE`, `DATABRICKS_WAREHOUSE_ID`), the alert address (`BUNDLE_VAR_alert_email`, required by every bundle command; failure emails arrive on Free Edition, verified) and the catalog/schema names live in `.env`, which is git-ignored. `.env.example` is the committed template. Add new variables to both files, and only when code uses them. Never put tokens in `.env`, because auth is OAuth.
 - Unity Catalog: catalog `medallion` with schemas `00_bronze`, `01_silver`, `02_gold`. The user chose these names so the schemas sort in pipeline order. Unquoted names like `medallion.00_bronze.trips` parse fine (checked on the warehouse), and the setup script quotes them with backticks anyway. Free Edition's metastore has no storage root, so `databricks catalogs create` fails. Create catalogs with SQL on the serverless warehouse, which uses Default Storage. The only warehouse is the "Serverless Starter Warehouse". Stop it after ad-hoc SQL to save quota.
 - Local: Python 3.11 and Java 17 (Homebrew `openjdk@17`). Versions are pinned in `requirements.txt` (PySpark 4.2.0 + delta-spark 4.4.0) and were verified together locally. They match serverless compute, which was checked in step 2 and runs Spark 4.2.0 on Python 3.11. Re-check if the serverless environment changes.
 
@@ -62,6 +63,7 @@ databricks bundle run clean_trips                            # must report rows_
 databricks bundle run build_trip_metrics                     # incremental from silver's change feed; fails with DataQualityError if a check fails
 databricks bundle run build_trip_metrics --params full_rebuild=true   # ignore the watermark and rebuild every date
 databricks bundle run maintain_tables                        # weekly Delta maintenance; --params optimize_full=true re-clusters, vacuum=run really deletes
+databricks bundle run monitor_pipeline                       # freshness + quarantine checks into ops.check_results; fails (and emails) if one fails
 .venv/bin/python scripts/measure_pruning.py "<query>"        # files read vs pruned, from query history (reports if it came from cache)
 databricks jobs list-runs --job-id <id> --limit 3            # the run's `trigger` field shows TABLE / PERIODIC / ONE_TIME
 ```
@@ -86,6 +88,7 @@ Layout: notebooks are Databricks source files (`# Databricks notebook source`, `
 - `migrations.py`: parsing, run order, pending/drift detection, statement splitting, placeholders, bronze DDL generation
 - `incremental.py`: `plan_run` (full / incremental / nothing to do) and `changed_keys` from a change feed
 - `maintenance.py`: `tables_to_maintain` (skips `_tmp_`), `describe_change` (before/after files and size)
+- `observability.py`: `freshness_check`, `quarantine_rate_check`, `check_result_rows` (the `ops.check_results` row shape)
 
 New logic goes into `src/medallion/` with tests. `DeltaTable` `MERGE`s and table writes stay in the notebooks, because the tests use plain local Spark without Delta.
 
@@ -129,6 +132,13 @@ Source data facts (`samples.nyctaxi.trips`): 21,932 rows, Jan–Feb 2016, and no
 - Incremental runs can only check *after* writing, so the job notes gold's version first and runs `RESTORE TABLE … TO VERSION AS OF` if a check fails. The watermark moves only after the checks pass.
 - **Serverless retries a failed task automatically** (verified: two attempts, each rolling itself back). Anything that writes must be safe to run twice.
 - `ops` migrations live in `src/ops/<table>/` and run after the layer folders.
+
+**Observability (step 15).**
+- Every job gets failure and duration emails, a `RUN_DURATION_SECONDS` health rule and a timeout from the `add_alerting` **mutator** in `resources/__init__.py`, which runs on YAML and generated jobs alike. Don't add `email_notifications` per job.
+- The address is the bundle variable `alert_email`, with **no default** (public repo): every `bundle` command fails without `BUNDLE_VAR_alert_email`. `bundle run` doesn't redeploy, so any value works for it.
+- Every health check result goes to `<catalog>.ops.check_results` (append-only, `delta.appendOnly`), **written before the run fails** (gold restores first), with `run_id` from the `{{job.run_id}}` job parameter, as an **insert-only `MERGE` on `(job, run_id, check_name)`**: a plain append recorded every check twice when serverless retried (verified). Its DDL has its own folder, `src/ops/check_results/`, because it has two writers. One shape for every check: `{check, passed, actual, expected, table?}`.
+- `monitor_pipeline` checks freshness (bronze `_ingested_at` against `max_age_hours` in `config/sources.toml`; sources without it aren't checked) and the quarantine rate. Job failures and durations come from `system.lakeflow`, never a hand-built run log.
+- Free Edition can read `system.lakeflow`, `system.billing`, `system.query` and `system.access`, and a view over them can live in our catalog (verified 2026-11-10). They run behind: still empty 50 minutes after the first runs on a new workspace.
 
 ## Working agreements
 

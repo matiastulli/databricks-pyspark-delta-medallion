@@ -14,6 +14,8 @@ FIELDS_BY_KIND = {
     "table": {"kind", "table", "mode", "schedule"},
     "files": {"kind", "volume", "path", "format", "mode", "schedule"},
 }
+# Settings every kind may add. A source without max_age_hours simply isn't checked for freshness.
+OPTIONAL_FIELDS = {"max_age_hours"}
 FILE_FORMATS = {"json", "csv", "parquet"}
 IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*$")
 QUALIFIED_TABLE = re.compile(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+$")
@@ -38,6 +40,7 @@ class Source:
     volume: str | None = None  # kind = "files"
     path: str | None = None
     format: str | None = None
+    max_age_hours: float | None = None  # freshness: monitor_pipeline fails when the newest row is older than this
 
     @property
     def name(self) -> str:
@@ -71,7 +74,7 @@ def parse_sources(config: dict) -> list[Source]:
         if missing := fields - entry.keys():
             problems.append(f"{label}: missing {sorted(missing)}")
         # An unknown key is almost always a typo (`mdoe`), and ignoring it would fall back to the wrong behavior.
-        if unknown := entry.keys() - fields:
+        if unknown := entry.keys() - fields - OPTIONAL_FIELDS:
             problems.append(f"{label}: unknown {sorted(unknown)}")
         if kind == "table" and "table" in entry:
             if not QUALIFIED_TABLE.match(str(entry["table"])):
@@ -92,6 +95,11 @@ def parse_sources(config: dict) -> list[Source]:
                 problems.append(f"{label}: files are ingested incrementally, so mode must be 'append'")
         if "mode" in entry and entry["mode"] not in MODES:
             problems.append(f"{label}: mode {entry['mode']!r} must be one of {sorted(MODES)}")
+        # bool is an int in Python, so `max_age_hours = true` would otherwise pass as 1 hour.
+        if "max_age_hours" in entry:
+            age = entry["max_age_hours"]
+            if isinstance(age, bool) or not isinstance(age, (int, float)) or age <= 0:
+                problems.append(f"{label}: max_age_hours {age!r} must be a positive number of hours")
         # Jobs use Quartz cron (6-7 fields, seconds first). A 5-field Unix cron is the usual mistake.
         if "schedule" in entry and len(str(entry["schedule"]).split()) not in (6, 7):
             problems.append(f"{label}: schedule {entry['schedule']!r} must be a Quartz cron with 6 or 7 fields")

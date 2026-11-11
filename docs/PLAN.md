@@ -2,7 +2,7 @@
 
 How this project is built, one step at a time. Each step lands in its own commits, and later steps are only planned here: their code is written when the step starts, so the details below may change as earlier steps teach us something.
 
-**Status:** ✅ all steps done (0–14)
+**Status:** 🚧 step 15 in progress (0–14 done)
 
 | Step | Status | What it delivers |
 |---|---|---|
@@ -21,6 +21,7 @@ How this project is built, one step at a time. Each step lands in its own commit
 | 12. DDL folder per table | ✅ Done | A table's whole history in one folder named after it, with migrations identified by checksum instead of path |
 | 13. Folders say what they hold | ✅ Done | Notebooks in a `notebooks/` folder next to `ddl/` in every `src/` folder, and the demo helper out of bronze into `src/tools/` (layout superseded by step 14) |
 | 14. Folders by process | ✅ Done | One folder per process holding its notebook and the DDL of the tables it writes, generic code in `_` folders, the same layout as the AWS sibling repo |
+| 15. Observability | 🚧 In progress | Failure alerts on every job, run history from system tables, and health checks (freshness, quarantine rate, gold quality) recorded in one table |
 
 ## Constraints that shape every step
 
@@ -611,6 +612,61 @@ Verified on the workspace:
 - Every moved notebook ran on serverless: `ingest_landing_trips` (0 rows, checkpoint untouched), `ingest_tpch_region` (5 rows, overwrite), `clean_trips` (0 inserted; 21,847 trips, 85 quarantined), `build_trip_metrics` (incremental, 0 dates rebuilt, 13/13 checks) and `maintain_tables` (13 tables, vacuum dry run)
 - Not rerun: `seed_landing_files` (imports nothing; `bundle validate` shows its new path)
 - 66 tests pass, including new ones: DDL in a `_` folder, a table split across folders, two tables in one folder, a file without the `ddl_` prefix
+
+## 15. Observability 🚧
+
+**Goal:** answer "is the pipeline healthy, and how has it been doing?" without opening runs one by one. Until now every notebook printed a JSON summary that lived only in the run output, the gold checks raised and were forgotten, and nothing told anyone a job had failed.
+
+**How it relates to the sibling repo.** [dbt-terraform-postgres-medallion](https://github.com/matiastulli/dbt-terraform-postgres-medallion) builds its observability by hand: an `on-run-end` hook appends one row per dbt node to `audit.run_log`, dropped rows are stored with `store_failures`, and volume rules on that log are planned. It deliberately has no alerting, no source freshness (its seeds have no load timestamp) and no rejection reasons. So this step uses what Databricks gives you instead of a second hand-built copy, and covers exactly what the dbt repo can't.
+
+**Phase 1** (this step's first PR):
+
+1. **Failure alerts on every job.** A `job_mutator` in `resources/__init__.py` adds `email_notifications.on_failure`, a `timeout_seconds` and a `RUN_DURATION_SECONDS` health rule to every job, YAML and generated alike, so a new job can't forget them. The address is the bundle variable `alert_email`, set through `BUNDLE_VAR_alert_email` in `.env` (public repo: no address in committed files).
+2. **Run history from system tables.** A view `ops.job_runs` over `system.lakeflow.jobs`, `job_run_timeline` and `job_task_run_timeline`: one row per run with job name, trigger, result state and duration. A view is a published object, so it's a migration in `src/ops/job_runs/`.
+3. **`ops.check_results`, one append-only table for every health check:** `run_id`, `job`, `check`, `table_name`, `passed`, `actual`, `expected`, `checked_at`. `run_id` comes from the `{{job.run_id}}` job parameter, so a check joins to `ops.job_runs`. It's the only thing a system table can't give us.
+4. **Gold quality results are kept:** `build_trip_metrics` appends its 13 checks to `ops.check_results` before it raises (or after it passes).
+5. **A `monitor_pipeline` job** (`src/ops/_monitoring/notebook_monitor_pipeline.py`, daily, paused in dev) appends to `ops.check_results` and fails if any check fails, which reuses item 1 as its notification channel:
+   1. **Freshness:** the latest `_ingested_at` of each bronze table against a new per-source `max_age_hours` in `config/sources.toml`. A source without it isn't checked.
+   2. **Quarantine rate:** quarantined trips over all distinct trips, failing above `max_quarantine_rate` (1%; about 0.4% today). The rate for each `rejection_reason` is *not* copied into `ops.check_results`: it's a query on `trips_quarantine` whenever it's needed, so the dashboard reads it from there.
+
+The pass/fail logic is pure functions in `src/medallion/observability.py` with tests, because a check that silently passes is the bug this step exists to prevent.
+
+**Phase 2** (after phase 1 has run for real):
+- **Volume from Delta history:** rows written per version from `DESCRIBE HISTORY`'s `operationMetrics`, compared with the previous write, as more `monitor_pipeline` checks.
+- **An AI/BI dashboard and SQL alerts** in the bundle, over `ops.job_runs` and `ops.check_results`.
+- **Lakehouse Monitoring on one gold table,** tried once to see whether Free Edition allows it and what it costs in quota.
+
+**Out of scope:** DLT (Lakeflow) expectations, because they mean rewriting a layer as a declarative pipeline and this repo is PySpark + Delta. A hand-built run log table, because `system.lakeflow` already is one.
+
+**Verified on Free Edition before building** (2026-11-10, on a new workspace after the old one expired):
+- Readable: `system.lakeflow` (`jobs`, `job_run_timeline`, `job_task_run_timeline`, `job_tasks`, `pipelines`), `system.billing.usage` and `list_prices`, `system.query.history`, `system.access.audit` and `table_lineage`
+- A view over `system.lakeflow` can be created in `medallion.ops` and read (on a throwaway `_tmp_` view, dropped afterwards)
+- **They run behind:** `job_run_timeline` was still empty 50 minutes after the first runs. `ops.job_runs` is written once real rows show what's in them (e.g. whether `job_parameters` carries `catalog`, to filter runs to this catalog).
+
+**Phase 1, verified on the workspace** (items 1, 3, 4, 5; `ops.job_runs` waits for `system.lakeflow`):
+
+| Step | Result |
+|---|---|
+| `bundle validate -o json` | all 15 jobs carry `on_failure`, the 1200 s health rule and a 3600 s timeout |
+| `apply_ddl` | 25 already applied, `ops/check_results/ddl_check_results_v001_create.sql` applied |
+| `build_trip_metrics --params full_rebuild=true` | 13 rows in `ops.check_results`, all passed, with the job's `run_id` |
+| `monitor_pipeline` | 9 checks (8 freshness, 1 quarantine at 0.39%), all passed |
+| `monitor_pipeline --params max_quarantine_rate=0.001` | **failed** with `DataQualityError`, after writing its rows. But it wrote 18 rows for one `run_id`: serverless retried the task, and each attempt appended its 9 |
+| `DELETE FROM ops.check_results …` | refused: `DELTA_CANNOT_MODIFY_APPEND_ONLY` |
+
+**Fixed after review:**
+- **The write wasn't safe to run twice** (the 18 rows above). It's now an insert-only `MERGE` on `(job, run_id, check_name)`, so a retry records nothing new. Those 9 duplicate rows stay: the table is append-only, which is the point of it. Verified: `delta.appendOnly` accepts an insert-only `MERGE`; a rerun with an already recorded `run_id` added 0 rows; the same forced failure, retried by serverless again, now left 9 rows instead of 18.
+- **Gold recorded its checks before restoring,** so a failure while recording would have skipped the `RESTORE` and left a failed aggregate published. It now restores, then records, then raises.
+
+**Decisions:**
+- `ops.check_results` has two writers (gold and the monitor), so its DDL has its own folder, `src/ops/check_results/`, like `processed_versions`: a table with no single owning process.
+- The duplicate rows are prevented by the key, not hidden by readers: one rule in two writers instead of one in every query.
+
+**Failure emails arrive on Free Edition** (verified 2026-11-10: the forced `monitor_pipeline` failure emailed the `alert_email` address).
+
+**Rebuilt from the repo on the new workspace,** which tested the setup path end to end: `setup_unity_catalog.sh`, `bundle deploy` (14 jobs), `apply_ddl` (25 migrations on an empty catalog), every ingest, `clean_trips`, `build_trip_metrics`.
+
+**Learned:** `bundle run` loads the whole config, so a new required variable fails every run until it's set, not just the deploy.
 
 ---
 

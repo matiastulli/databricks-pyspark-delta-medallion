@@ -31,6 +31,12 @@ def test_a_source_says_where_its_data_comes_from():
     assert parse_sources({"sources": [files_entry()]})[0].location == "/Volumes/{catalog}/{bronze_schema}/landing/trips"
 
 
+def test_max_age_hours_is_optional_for_both_kinds():
+    assert parse_sources({"sources": [table_entry()]})[0].max_age_hours is None
+    assert parse_sources({"sources": [table_entry(max_age_hours=26)]})[0].max_age_hours == 26
+    assert parse_sources({"sources": [files_entry(max_age_hours=1.5)]})[0].max_age_hours == 1.5
+
+
 def test_two_sources_landing_in_the_same_bronze_table_are_rejected():
     # Different catalogs, same system and table: both would derive tpch_orders and mix their rows.
     config = {"sources": [table_entry(), table_entry(table="other_catalog.tpch.orders")]}
@@ -56,6 +62,10 @@ def test_two_sources_landing_in_the_same_bronze_table_are_rejected():
         (files_entry(mode="overwrite"), "files are ingested incrementally, so mode must be 'append'"),
         ({**files_entry(), "table": "samples.tpch.orders"}, r"unknown \['table'\]"),
         ({key: value for key, value in files_entry().items() if key != "volume"}, r"missing \['volume'\]"),
+        # Freshness thresholds: a zero, a string or a bool would make the check meaningless.
+        (table_entry(max_age_hours=0), "max_age_hours 0 must be a positive number"),
+        (table_entry(max_age_hours="26"), "max_age_hours '26' must be a positive number"),
+        (table_entry(max_age_hours=True), "max_age_hours True must be a positive number"),
     ],
 )
 def test_entries_that_would_load_the_wrong_way_are_rejected(bad_entry, message):

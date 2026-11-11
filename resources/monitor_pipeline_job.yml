@@ -1,0 +1,33 @@
+resources:
+  jobs:
+    monitor_pipeline:
+      name: monitor_pipeline
+      description: Health checks on the pipeline's data (freshness, quarantine rate), recorded in ops.check_results; fails if any check fails
+      tags:
+        layer: ops
+
+      # Daily, after the morning ingestion (05:00-06:30 UTC). Paused in the dev target like every schedule.
+      schedule:
+        quartz_cron_expression: "0 0 8 * * ?"
+        timezone_id: UTC
+
+      max_concurrent_runs: 1
+
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: bronze_schema
+          default: ${var.bronze_schema}
+        - name: silver_schema
+          default: ${var.silver_schema}
+        # Share of all distinct trips that may be quarantined before the run fails (today about 0.4%).
+        - name: max_quarantine_rate
+          default: "0.01"
+        # Filled in by Databricks at run time, so each result row joins to its run in system.lakeflow.
+        - name: run_id
+          default: "{{job.run_id}}"
+
+      tasks:
+        - task_key: monitor_pipeline
+          notebook_task:
+            notebook_path: ../src/ops/_monitoring/notebook_monitor_pipeline.py
